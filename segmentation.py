@@ -16,6 +16,8 @@ class SegmentationResult:
     frame: np.ndarray
     segments: np.ndarray
     boundaries: np.ndarray
+    mask_overlay: Optional[np.ndarray] = None
+    mask_classes: Optional[np.ndarray] = None
 
 
 class SegmentationProcessor:
@@ -27,6 +29,7 @@ class SegmentationProcessor:
         slic_compactness: float = 12.0,
         slic_sigma: float = 1.0,
         segmentation_color_tolerance: int = 25,
+        mask_drivable_class_id: int = 1,
     ) -> None:
         self.camera_matrix = np.array(
             [[320.0, 0.0, 320.0], [0.0, 320.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32
@@ -39,6 +42,7 @@ class SegmentationProcessor:
         self.slic_compactness = slic_compactness
         self.slic_sigma = slic_sigma
         self.segmentation_color_tolerance = segmentation_color_tolerance
+        self.mask_drivable_class_id = mask_drivable_class_id
 
     def _ensure_maps(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
@@ -77,7 +81,13 @@ class SegmentationProcessor:
                 )
             segments = self._mask_to_segments(target_mask, color_map)
             boundaries = find_boundaries(segments, mode="inner")
-            return SegmentationResult(frame=undistorted, segments=segments, boundaries=boundaries)
+            return SegmentationResult(
+                frame=undistorted,
+                segments=segments,
+                boundaries=boundaries,
+                mask_overlay=target_mask,
+                mask_classes=segments,
+            )
         proc_frame = undistorted
         scale = np.clip(self.downscale_factor, 0.1, 1.0)
         if scale < 1.0:

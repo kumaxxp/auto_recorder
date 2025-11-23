@@ -14,7 +14,7 @@ num-detected-classes=2
 output-blob-names=prob
 segmentation-threshold=0.5
 segmentation-output-order=0
-maintain-aspect-ratio=1
+maintain-aspect-ratio=0
 process-mode=1
 
 [class-attrs-all]
@@ -22,4 +22,4 @@ threshold=0.5
 
 [segmentation]
 overlay-color0=0;0;0;0
-overlay-color1=0;200;0;160
+overlay-color1=0;255;0;255

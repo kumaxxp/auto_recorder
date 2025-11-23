@@ -395,7 +395,7 @@ class _GStreamerSegmentationBackend:
         if not masksink or not rgbsink:
             raise RuntimeError("Failed to find appsinks in GStreamer pipeline")
         for sink in (masksink, rgbsink):
-            sink.set_property("emit-signals", False)
+            sink.set_property("emit-signals", True)  # Changed to True to enable try-pull-sample
             sink.set_property("sync", False)
             sink.set_property("max-buffers", 1)
             sink.set_property("drop", True)
@@ -412,20 +412,27 @@ class _GStreamerSegmentationBackend:
         config_path: Path,
     ) -> "Gst.Pipeline":
         config = shlex.quote(str(config_path.resolve()))
-        mask_width = sensor_width
-        mask_height = sensor_height
+        # Use class dimensions for processing to ensure consistent sizing
+        proc_width = self._width
+        proc_height = self._height
+        # Use model dimensions for segmentation to ensure full coverage
+        seg_width = 256
+        seg_height = 256
+        
         pipeline_desc = (
             f"nvarguscamerasrc sensor-id={sensor_id} ! "
             f"video/x-raw(memory:NVMM), width={sensor_width}, height={sensor_height}, framerate={fps}/1 ! "
-            f"nvvidconv flip-method={flip_method} ! video/x-raw(memory:NVMM), format=NV12 ! "
+            f"nvvidconv flip-method={flip_method} ! video/x-raw(memory:NVMM), width={proc_width}, height={proc_height}, format=NV12 ! "
             "tee name=rawtee "
             "rawtee. ! queue ! nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=rgbsink "
-            "rawtee. ! queue ! nvvidconv ! video/x-raw(memory:NVMM), format=NV12 ! mux.sink_0 "
-            f"nvstreammux name=mux width={sensor_width} height={sensor_height} batch-size=1 live-source=1 enable-padding=0 ! "
+            "rawtee. ! queue ! mux.sink_0 "
+            f"nvstreammux name=mux width={seg_width} height={seg_height} batch-size=1 live-source=1 enable-padding=0 ! "
             f"nvinfer batch-size=1 unique-id=1 config-file-path={config} ! "
-            f"nvsegvisual width={mask_width} height={mask_height} ! "
+            f"nvsegvisual width={seg_width} height={seg_height} ! "
             "nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=masksink"
         )
+        # Debug: print pipeline string
+        # print(f"DEBUG: Pipeline string: {pipeline_desc}")
         pipeline = Gst.parse_launch(pipeline_desc)
         return pipeline
 
@@ -433,14 +440,20 @@ class _GStreamerSegmentationBackend:
         self._pipeline.set_state(Gst.State.PLAYING)
 
     def pull_frame(self, timeout: float = 1.0) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        # Try pulling mask first to ensure sync if possible, though they are independent appsinks
         mask_sample = self._mask_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
         rgb_sample = self._rgb_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
+        
         if rgb_sample is None:
             return None
+            
         frame = self._sample_to_ndarray(rgb_sample)
         mask = None
         if mask_sample is not None:
             mask = self._sample_to_ndarray(mask_sample)
+        # else:
+        #     print("DEBUG: Mask sample is None in pull_frame")
+            
         return frame, mask
 
     @staticmethod
