@@ -13,6 +13,8 @@ from camera_stream import CameraStream
 from labeling import LABEL_COLORS, LabelManager, Metrics, SegmentLabel
 from segmentation import SegmentationProcessor
 
+CITYSCAPES_DRIVABLE_CLASS_IDS = (3, 4)  # road, sidewalk
+
 
 class SegmentationDashboard:
     """High-level controller wiring NiceGUI with processing logic."""
@@ -38,6 +40,7 @@ class SegmentationDashboard:
         self._slider_label: Optional[ui.label] = None
         self._dragging_roi = False
         self._timer: Optional[ui.timer] = None
+        self._drivable_class_ids = CITYSCAPES_DRIVABLE_CLASS_IDS
 
     def mount(self) -> None:
         with ui.row().classes("w-full items-start gap-6"):
@@ -155,58 +158,7 @@ class SegmentationDashboard:
         return blended
 
     def _compose_mask_overlay(self, result: SegmentationResult) -> np.ndarray:
-        # The mask_overlay from DeepStream is the colored mask.
-        # We blend it with the original frame.
-        if result.mask_overlay is not None:
-            try:
-                # Heuristic: The most frequent color is the background.
-                # We want to mask everything that is NOT the background.
-                
-                # Reshape to list of pixels
-                pixels = result.mask_overlay.reshape(-1, 3)
-                
-                # Find unique colors and their counts
-                colors, counts = np.unique(pixels, axis=0, return_counts=True)
-                
-                if len(colors) > 0:
-                    # Get the most frequent color (background)
-                    bg_color = colors[np.argmax(counts)]
-                    
-                    # Create a mask for everything that is NOT the background
-                    # cv2.inRange is inclusive, so we can't easily do "not equal".
-                    # Instead, we create a mask for the background and invert it.
-                    lower_bg = np.array(bg_color, dtype=np.uint8)
-                    upper_bg = np.array(bg_color, dtype=np.uint8)
-                    
-                    # Allow small tolerance for compression artifacts
-                    tolerance = 5
-                    lower_bg = np.clip(lower_bg - tolerance, 0, 255)
-                    upper_bg = np.clip(upper_bg + tolerance, 0, 255)
-                    
-                    bg_mask = cv2.inRange(result.mask_overlay, lower_bg, upper_bg)
-                    
-                    # Invert mask to get foreground (drivable area + others)
-                    fg_mask = cv2.bitwise_not(bg_mask)
-                    
-                    # Create the output frame
-                    blended = result.frame.copy()
-                    
-                    # Apply green tint to foreground
-                    roi = blended[fg_mask > 0]
-                    if roi.size > 0:
-                        green = np.full_like(roi, (0, 255, 0))
-                        blended[fg_mask > 0] = cv2.addWeighted(roi, 0.4, green, 0.6, 0.0)
-                    
-                    y = int(np.clip(self.roi_y, 0, blended.shape[0] - 1))
-                    cv2.line(blended, (0, y), (blended.shape[1] - 1, y), (255, 255, 0), 2)
-                    return blended
-            except Exception as e:
-                print(f"Error in _compose_mask_overlay: {e}")
-                return result.frame
-            
-            return result.frame
-            
-        # Fallback for SLIC or other modes
+        # DeepStream already outputs a colorized mask; blend it directly for clarity.
         overlay = result.mask_overlay
         if overlay is None:
             return result.frame
@@ -219,24 +171,14 @@ class SegmentationDashboard:
         roi = mask_classes[self.roi_y :, :]
         if roi.size == 0:
             return Metrics(0.0, 0.0, "STOP")
-        drivable_class = self.processor.mask_drivable_class_id
-        drive_mask = roi == drivable_class
-        drivable_ratio = float(drive_mask.sum()) / float(roi.size)
+        drive_mask = np.isin(roi, self._drivable_class_ids)
+        drivable_ratio = float(drive_mask.mean())
         mid = roi.shape[1] // 2
         left_drive = float(drive_mask[:, :mid].sum())
         right_drive = float(drive_mask[:, mid:].sum())
         right_norm = max(right_drive, 1.0)
         left_right_ratio = left_drive / right_norm
-        if drivable_ratio < 0.1:
-            decision = "STOP"
-        elif drivable_ratio > 0.6:
-            decision = "FORWARD"
-        elif left_drive > right_drive:
-            decision = "TURN_LEFT"
-        elif right_drive > left_drive:
-            decision = "TURN_RIGHT"
-        else:
-            decision = "STOP"
+        decision = "GO" if drivable_ratio > 0.10 else "STOP"
         return Metrics(drivable_ratio, left_right_ratio, decision)
 
     @staticmethod

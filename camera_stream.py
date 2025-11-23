@@ -416,7 +416,7 @@ class _GStreamerSegmentationBackend:
         proc_width = self._width
         proc_height = self._height
         # Use model dimensions for segmentation to ensure full coverage
-        seg_width = 256
+        seg_width = 512
         seg_height = 256
         
         pipeline_desc = (
