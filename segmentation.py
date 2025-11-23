@@ -43,6 +43,7 @@ class SegmentationProcessor:
         self.slic_sigma = slic_sigma
         self.segmentation_color_tolerance = segmentation_color_tolerance
         self.mask_drivable_class_id = mask_drivable_class_id
+        self._color_lut_cache: Dict[Tuple[Tuple[int, Tuple[int, int, int]], ...], np.ndarray] = {}
 
     def _ensure_maps(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
@@ -116,12 +117,25 @@ class SegmentationProcessor:
     def _mask_to_segments(
         self, mask: np.ndarray, color_map: Dict[int, Tuple[int, int, int]]
     ) -> np.ndarray:
-        segments = np.zeros(mask.shape[:2], dtype=np.int32)
-        mask_int = mask.astype(np.int16)
-        tolerance = int(np.clip(self.segmentation_color_tolerance, 0, 128))
-        for label, bgr in color_map.items():
-            color_vec = np.array(bgr, dtype=np.int16)
-            diff = np.abs(mask_int - color_vec)
-            matches = np.all(diff <= tolerance, axis=2)
-            segments[matches] = label
+        lut = self._lookup_color_lut(color_map)
+        mask_b = mask[..., 0].astype(np.uint32)
+        mask_g = mask[..., 1].astype(np.uint32)
+        mask_r = mask[..., 2].astype(np.uint32)
+        codes = mask_b | (mask_g << 8) | (mask_r << 16)
+        segments = lut[codes].astype(np.int32)
         return segments
+
+    def _lookup_color_lut(
+        self, color_map: Dict[int, Tuple[int, int, int]]
+    ) -> np.ndarray:
+        key = tuple(sorted(color_map.items()))
+        lut = self._color_lut_cache.get(key)
+        if lut is not None:
+            return lut
+        size = 1 << 24  # 24-bit BGR lookup
+        lut = np.zeros(size, dtype=np.uint8)
+        for label, (b, g, r) in color_map.items():
+            code = (int(b) & 0xFF) | ((int(g) & 0xFF) << 8) | ((int(r) & 0xFF) << 16)
+            lut[code] = np.uint8(label)
+        self._color_lut_cache[key] = lut
+        return lut

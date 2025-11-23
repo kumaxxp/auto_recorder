@@ -78,6 +78,7 @@ class CameraStream:
         self._gst_backend: Optional[_GStreamerSegmentationBackend] = None
         self._using_gst_segmentation = False
         self._mask: Optional[np.ndarray] = None
+        self._class_mask: Optional[np.ndarray] = None
         config_path = (
             Path(gstreamer_segmentation_config).expanduser()
             if gstreamer_segmentation_config
@@ -286,16 +287,22 @@ class CameraStream:
             payload = self._gst_backend.pull_frame(timeout=1.0)
             if payload is None:
                 continue
-            frame, mask = payload
+            frame, overlay, class_mask = payload
             resized = cv2.resize(frame, (self.width, self.height))
-            mask_resized = None
-            if mask is not None:
-                mask_resized = cv2.resize(
-                    mask, (self.width, self.height), interpolation=cv2.INTER_NEAREST
+            overlay_resized = None
+            if overlay is not None:
+                overlay_resized = cv2.resize(
+                    overlay, (self.width, self.height), interpolation=cv2.INTER_LINEAR
+                )
+            class_resized = None
+            if class_mask is not None:
+                class_resized = cv2.resize(
+                    class_mask, (self.width, self.height), interpolation=cv2.INTER_NEAREST
                 )
             with self._lock:
                 self._frame = resized
-                self._mask = mask_resized
+                self._mask = overlay_resized
+                self._class_mask = class_resized
 
     def read(self) -> Optional[np.ndarray]:
         with self._lock:
@@ -308,6 +315,12 @@ class CameraStream:
             if self._mask is None:
                 return None
             return self._mask.copy()
+
+    def read_mask_classes(self) -> Optional[np.ndarray]:
+        with self._lock:
+            if self._class_mask is None:
+                return None
+            return self._class_mask.copy()
 
     def get_segmentation_color_map(self) -> Dict[int, Tuple[int, int, int]]:
         return dict(self._gst_color_map)
@@ -391,15 +404,19 @@ class _GStreamerSegmentationBackend:
             config_path=config_path,
         )
         masksink = self._pipeline.get_by_name("masksink")
+        classsink = self._pipeline.get_by_name("classsink")
         rgbsink = self._pipeline.get_by_name("rgbsink")
         if not masksink or not rgbsink:
             raise RuntimeError("Failed to find appsinks in GStreamer pipeline")
-        for sink in (masksink, rgbsink):
-            sink.set_property("emit-signals", True)  # Changed to True to enable try-pull-sample
+        for sink in (masksink, rgbsink, classsink):
+            if sink is None:
+                continue
+            sink.set_property("emit-signals", False)
             sink.set_property("sync", False)
             sink.set_property("max-buffers", 1)
             sink.set_property("drop", True)
         self._mask_sink = masksink
+        self._class_sink = classsink
         self._rgb_sink = rgbsink
 
     def _create_pipeline(
@@ -427,9 +444,9 @@ class _GStreamerSegmentationBackend:
             "rawtee. ! queue ! nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=rgbsink "
             "rawtee. ! queue ! mux.sink_0 "
             f"nvstreammux name=mux width={seg_width} height={seg_height} batch-size=1 live-source=1 enable-padding=0 ! "
-            f"nvinfer batch-size=1 unique-id=1 config-file-path={config} ! "
-            f"nvsegvisual width={seg_width} height={seg_height} ! "
-            "nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=masksink"
+                        f"nvinfer batch-size=1 unique-id=1 config-file-path={config} ! "
+                        f"nvsegvisual width={seg_width} height={seg_height} ! "
+                        "nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=masksink"
         )
         # Debug: print pipeline string
         # print(f"DEBUG: Pipeline string: {pipeline_desc}")
@@ -439,25 +456,29 @@ class _GStreamerSegmentationBackend:
     def start(self) -> None:
         self._pipeline.set_state(Gst.State.PLAYING)
 
-    def pull_frame(self, timeout: float = 1.0) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
-        # Try pulling mask first to ensure sync if possible, though they are independent appsinks
-        mask_sample = self._mask_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
-        rgb_sample = self._rgb_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
-        
+    def pull_frame(self, timeout: float = 1.0) -> Optional[Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]]:
+        mask_sample = self._mask_sink.emit("try-pull-sample", int(timeout * Gst.SECOND)) if self._mask_sink else None
+        class_sample = (
+            self._class_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
+            if self._class_sink
+            else None
+        )
+        rgb_sample = self._rgb_sink.emit("try-pull-sample", int(timeout * Gst.SECOND)) if self._rgb_sink else None
+
         if rgb_sample is None:
             return None
-            
-        frame = self._sample_to_ndarray(rgb_sample)
+
+        frame = self._sample_to_ndarray(rgb_sample, channels=3)
         mask = None
         if mask_sample is not None:
-            mask = self._sample_to_ndarray(mask_sample)
-        # else:
-        #     print("DEBUG: Mask sample is None in pull_frame")
-            
-        return frame, mask
+            mask = self._sample_to_ndarray(mask_sample, channels=3)
+        class_map = None
+        if class_sample is not None:
+            class_map = self._sample_to_ndarray(class_sample, channels=1)
+        return frame, mask, class_map
 
     @staticmethod
-    def _sample_to_ndarray(sample) -> np.ndarray:
+    def _sample_to_ndarray(sample, channels: int = 3) -> np.ndarray:
         caps = sample.get_caps()
         structure = caps.get_structure(0)
         width = structure.get_value("width")
@@ -467,9 +488,14 @@ class _GStreamerSegmentationBackend:
         if not success:
             raise RuntimeError("Failed to map GStreamer buffer")
         try:
-            array = np.ndarray(
-                shape=(height, width, 3), dtype=np.uint8, buffer=map_info.data
-            ).copy()
+            if channels == 1:
+                array = np.ndarray(
+                    shape=(height, width), dtype=np.uint8, buffer=map_info.data
+                ).copy()
+            else:
+                array = np.ndarray(
+                    shape=(height, width, channels), dtype=np.uint8, buffer=map_info.data
+                ).copy()
         finally:
             buffer.unmap(map_info)
         return array
