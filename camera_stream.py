@@ -3,19 +3,34 @@
 from __future__ import annotations
 
 import platform
+import shlex
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:  # Optional JetCam backend for Jetson CSI cameras
     from jetcam.csi_camera import CSICamera  # type: ignore
 except ImportError:  # pragma: no cover - JetCam not required off Jetson
     CSICamera = None  # type: ignore
+
+try:  # Optional GStreamer bindings (DeepStream pipeline)
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    Gst.init(None)
+except Exception:  # pragma: no cover - optional dependency
+    Gst = None  # type: ignore
 
 
 class CameraStream:
@@ -39,6 +54,8 @@ class CameraStream:
         sensor_width: Optional[int] = None,
         sensor_height: Optional[int] = None,
         flip_method: int = 0,
+        use_gstreamer_segmentation: bool = False,
+        gstreamer_segmentation_config: Optional[str] = None,
     ) -> None:
         self.index = index
         self.width = width
@@ -58,6 +75,24 @@ class CameraStream:
         self._starting = False
         self._jetcam: Optional[CSICamera] = None  # type: ignore[valid-type]
         self._using_jetcam = False
+        self._gst_backend: Optional[_GStreamerSegmentationBackend] = None
+        self._using_gst_segmentation = False
+        self._mask: Optional[np.ndarray] = None
+        config_path = (
+            Path(gstreamer_segmentation_config).expanduser()
+            if gstreamer_segmentation_config
+            else None
+        )
+        self._gst_config = config_path if config_path and config_path.exists() else None
+        self._gst_color_map = (
+            self._parse_segmentation_colors(self._gst_config)
+            if self._gst_config
+            else {}
+        )
+        self._gst_plugins_ready = self._check_gst_plugins() if Gst is not None else False
+        self._use_gst_segmentation_flag = (
+            use_gstreamer_segmentation and self._gst_config is not None
+        )
 
     def _is_jetson(self) -> bool:
         return (
@@ -131,6 +166,11 @@ class CameraStream:
             and CSICamera is not None
         )
 
+    def _can_use_gst_segmentation(self) -> bool:
+        return bool(
+            self._use_gst_segmentation_flag and Gst is not None and self._gst_plugins_ready
+        )
+
     def start(self) -> None:
         if self._running:
             return
@@ -139,12 +179,42 @@ class CameraStream:
                 return
             self._starting = True
             try:
+                if self._can_use_gst_segmentation():
+                    try:
+                        self._start_with_gstreamer_segmentation()
+                        return
+                    except Exception:
+                        logger.exception(
+                            "Failed to start GStreamer segmentation backend; falling back"
+                        )
                 if self._should_use_jetcam():
                     self._start_with_jetcam()
                 else:
                     self._start_with_opencv()
             finally:
                 self._starting = False
+
+    def _start_with_gstreamer_segmentation(self) -> None:
+        if not self._gst_config:
+            raise RuntimeError("GStreamer segmentation config file not found")
+        logger.info("Starting GStreamer segmentation backend with %s", self._gst_config)
+        self._gst_backend = _GStreamerSegmentationBackend(
+            sensor_id=self.index,
+            sensor_width=self.sensor_width,
+            sensor_height=self.sensor_height,
+            width=self.width,
+            height=self.height,
+            fps=self.fps,
+            flip_method=self.flip_method,
+            config_path=self._gst_config,
+        )
+        self._gst_backend.start()
+        self._using_gst_segmentation = True
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._loop_gst_segmentation, daemon=True
+        )
+        self._thread.start()
 
     def _start_with_jetcam(self) -> None:
         self._jetcam = CSICamera(  # type: ignore[operator]
@@ -174,6 +244,11 @@ class CameraStream:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
+        if self._using_gst_segmentation and self._gst_backend:
+            logger.info("Stopping GStreamer segmentation backend")
+            self._gst_backend.stop()
+            self._gst_backend = None
+            self._using_gst_segmentation = False
         if self._using_jetcam and self._jetcam:
             try:
                 self._jetcam.cap.release()  # type: ignore[attr-defined]
@@ -206,11 +281,36 @@ class CameraStream:
             with self._lock:
                 self._frame = resized
 
+    def _loop_gst_segmentation(self) -> None:
+        while self._running and self._gst_backend:
+            payload = self._gst_backend.pull_frame(timeout=1.0)
+            if payload is None:
+                continue
+            frame, mask = payload
+            resized = cv2.resize(frame, (self.width, self.height))
+            mask_resized = None
+            if mask is not None:
+                mask_resized = cv2.resize(
+                    mask, (self.width, self.height), interpolation=cv2.INTER_NEAREST
+                )
+            with self._lock:
+                self._frame = resized
+                self._mask = mask_resized
+
     def read(self) -> Optional[np.ndarray]:
         with self._lock:
             if self._frame is None:
                 return None
             return self._frame.copy()
+
+    def read_mask(self) -> Optional[np.ndarray]:
+        with self._lock:
+            if self._mask is None:
+                return None
+            return self._mask.copy()
+
+    def get_segmentation_color_map(self) -> Dict[int, Tuple[int, int, int]]:
+        return dict(self._gst_color_map)
 
     def is_running(self) -> bool:
         return self._running or self._starting
@@ -221,3 +321,151 @@ class CameraStream:
 
     def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
         self.stop()
+
+    @staticmethod
+    def _parse_segmentation_colors(config_path: Path) -> Dict[int, Tuple[int, int, int]]:
+        colors: Dict[int, Tuple[int, int, int]] = {}
+        try:
+            for raw_line in config_path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "overlay-color" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key.startswith("overlay-color"):
+                    continue
+                try:
+                    index = int(key.replace("overlay-color", ""))
+                except ValueError:
+                    continue
+                parts = [p.strip() for p in value.split(";")]
+                if len(parts) < 3:
+                    continue
+                try:
+                    r, g, b = (int(float(parts[0])), int(float(parts[1])), int(float(parts[2])))
+                except ValueError:
+                    continue
+                colors[index] = (b, g, r)  # convert to BGR
+        except OSError:
+            return {}
+        return colors
+
+    @staticmethod
+    def _check_gst_plugins() -> bool:
+        if Gst is None:
+            return False
+        required = ("nvarguscamerasrc", "nvvidconv", "nvinfer", "nvsegvisual")
+        missing = [name for name in required if Gst.ElementFactory.find(name) is None]
+        if missing:
+            logger.warning(
+                "Missing required GStreamer/DeepStream plugins: %s", ", ".join(missing)
+            )
+            return False
+        return True
+
+
+class _GStreamerSegmentationBackend:
+    """Runs a DeepStream-powered segmentation pipeline and surfaces frames."""
+
+    def __init__(
+        self,
+        sensor_id: int,
+        sensor_width: int,
+        sensor_height: int,
+        width: int,
+        height: int,
+        fps: int,
+        flip_method: int,
+        config_path: Path,
+    ) -> None:
+        if Gst is None:  # pragma: no cover - optional dependency
+            raise RuntimeError("GStreamer bindings are not available")
+        self._width = width
+        self._height = height
+        self._pipeline = self._create_pipeline(
+            sensor_id=sensor_id,
+            sensor_width=sensor_width,
+            sensor_height=sensor_height,
+            fps=fps,
+            flip_method=flip_method,
+            config_path=config_path,
+        )
+        masksink = self._pipeline.get_by_name("masksink")
+        rgbsink = self._pipeline.get_by_name("rgbsink")
+        if not masksink or not rgbsink:
+            raise RuntimeError("Failed to find appsinks in GStreamer pipeline")
+        for sink in (masksink, rgbsink):
+            sink.set_property("emit-signals", False)
+            sink.set_property("sync", False)
+            sink.set_property("max-buffers", 1)
+            sink.set_property("drop", True)
+        self._mask_sink = masksink
+        self._rgb_sink = rgbsink
+
+    def _create_pipeline(
+        self,
+        sensor_id: int,
+        sensor_width: int,
+        sensor_height: int,
+        fps: int,
+        flip_method: int,
+        config_path: Path,
+    ) -> "Gst.Pipeline":
+        config = shlex.quote(str(config_path.resolve()))
+        mask_width = sensor_width
+        mask_height = sensor_height
+        pipeline_desc = (
+            f"nvarguscamerasrc sensor-id={sensor_id} ! "
+            f"video/x-raw(memory:NVMM), width={sensor_width}, height={sensor_height}, framerate={fps}/1 ! "
+            f"nvvidconv flip-method={flip_method} ! video/x-raw(memory:NVMM), format=RGBA ! "
+            "tee name=t "
+            "t. ! queue ! nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=rgbsink "
+            "t. ! queue ! nvinfer batch-size=1 unique-id=1 "
+            f"config-file-path={config} ! nvsegvisual width={mask_width} height={mask_height} ! "
+            "nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=masksink"
+        )
+        pipeline = Gst.parse_launch(pipeline_desc)
+        return pipeline
+
+    def start(self) -> None:
+        self._pipeline.set_state(Gst.State.PLAYING)
+
+    def pull_frame(self, timeout: float = 1.0) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        mask_sample = self._mask_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
+        rgb_sample = self._rgb_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
+        if rgb_sample is None:
+            if mask_sample:
+                mask_sample.unref()
+            return None
+        try:
+            frame = self._sample_to_ndarray(rgb_sample)
+        finally:
+            rgb_sample.unref()
+        mask = None
+        if mask_sample is not None:
+            try:
+                mask = self._sample_to_ndarray(mask_sample)
+            finally:
+                mask_sample.unref()
+        return frame, mask
+
+    @staticmethod
+    def _sample_to_ndarray(sample) -> np.ndarray:
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
+        width = structure.get_value("width")
+        height = structure.get_value("height")
+        buffer = sample.get_buffer()
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            raise RuntimeError("Failed to map GStreamer buffer")
+        try:
+            array = np.ndarray(
+                shape=(height, width, 3), dtype=np.uint8, buffer=map_info.data
+            ).copy()
+        finally:
+            buffer.unmap(map_info)
+        return array
+
+    def stop(self) -> None:
+        self._pipeline.set_state(Gst.State.NULL)

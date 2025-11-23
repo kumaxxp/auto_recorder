@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -26,6 +26,7 @@ class SegmentationProcessor:
         downscale_factor: float = 0.5,
         slic_compactness: float = 12.0,
         slic_sigma: float = 1.0,
+        segmentation_color_tolerance: int = 25,
     ) -> None:
         self.camera_matrix = np.array(
             [[320.0, 0.0, 320.0], [0.0, 320.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32
@@ -37,6 +38,7 @@ class SegmentationProcessor:
         self.downscale_factor = downscale_factor
         self.slic_compactness = slic_compactness
         self.slic_sigma = slic_sigma
+        self.segmentation_color_tolerance = segmentation_color_tolerance
 
     def _ensure_maps(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
@@ -57,8 +59,25 @@ class SegmentationProcessor:
         self._ensure_maps(frame)
         return cv2.remap(frame, self._map1, self._map2, interpolation=cv2.INTER_LINEAR)
 
-    def run(self, frame: np.ndarray, n_segments: int) -> SegmentationResult:
+    def run(
+        self,
+        frame: np.ndarray,
+        n_segments: int,
+        mask: Optional[np.ndarray] = None,
+        color_map: Optional[Dict[int, Tuple[int, int, int]]] = None,
+    ) -> SegmentationResult:
         undistorted = self.undistort(frame)
+        if mask is not None and color_map:
+            target_mask = mask
+            if mask.shape[:2] != undistorted.shape[:2]:
+                target_mask = cv2.resize(
+                    mask,
+                    (undistorted.shape[1], undistorted.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            segments = self._mask_to_segments(target_mask, color_map)
+            boundaries = find_boundaries(segments, mode="inner")
+            return SegmentationResult(frame=undistorted, segments=segments, boundaries=boundaries)
         proc_frame = undistorted
         scale = np.clip(self.downscale_factor, 0.1, 1.0)
         if scale < 1.0:
@@ -83,3 +102,16 @@ class SegmentationProcessor:
             segments = segments_small
         boundaries = find_boundaries(segments, mode="inner")
         return SegmentationResult(frame=undistorted, segments=segments, boundaries=boundaries)
+
+    def _mask_to_segments(
+        self, mask: np.ndarray, color_map: Dict[int, Tuple[int, int, int]]
+    ) -> np.ndarray:
+        segments = np.zeros(mask.shape[:2], dtype=np.int32)
+        mask_int = mask.astype(np.int16)
+        tolerance = int(np.clip(self.segmentation_color_tolerance, 0, 128))
+        for label, bgr in color_map.items():
+            color_vec = np.array(bgr, dtype=np.int16)
+            diff = np.abs(mask_int - color_vec)
+            matches = np.all(diff <= tolerance, axis=2)
+            segments[matches] = label
+        return segments

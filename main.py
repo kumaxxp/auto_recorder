@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from nicegui import app, ui
 
 from camera_stream import CameraStream
@@ -10,7 +12,12 @@ from segmentation import SegmentationProcessor
 from ui import SegmentationDashboard
 
 
-camera = CameraStream()
+SEGMENTATION_CONFIG = Path("configs/deepstream_drivable_segmentation.txt")
+
+camera = CameraStream(
+    use_gstreamer_segmentation=SEGMENTATION_CONFIG.exists(),
+    gstreamer_segmentation_config=str(SEGMENTATION_CONFIG),
+)
 processor = SegmentationProcessor()
 labels = LabelManager()
 dashboard = SegmentationDashboard(camera, processor, labels)

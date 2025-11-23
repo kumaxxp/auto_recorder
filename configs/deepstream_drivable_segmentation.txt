@@ -1,0 +1,28 @@
+# DeepStream nvinfer configuration for drivable-area segmentation.
+# Update onnx-file / model-engine-file with the actual network you deploy.
+[property]
+gpu-id=0
+net-scale-factor=0.00392156862745098
+infer-dims=3;512;512
+onnx-file=./models/drivable_area.onnx
+model-engine-file=./models/drivable_area.engine
+labelfile-path=./configs/drivable_labels.txt
+batch-size=1
+network-mode=2
+network-type=2
+num-detected-classes=3
+uff-input-order=0
+uff-input-blob-name=input
+output-blob-names=prob
+segmentation-threshold=0.5
+segmentation-output-order=0
+maintain-aspect-ratio=1
+process-mode=1
+
+[class-attrs-all]
+threshold=0.5
+
+[segmentation]
+overlay-color0=0;0;0;0
+overlay-color1=0;255;0;120
+overlay-color2=255;0;0;120

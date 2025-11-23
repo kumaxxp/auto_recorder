@@ -107,7 +107,14 @@ class SegmentationDashboard:
         frame = self.camera.read()
         if frame is None:
             return
-        result = self.processor.run(frame, self.superpixels)
+        mask = self.camera.read_mask()
+        color_map = self.camera.get_segmentation_color_map() if mask is not None else None
+        result = self.processor.run(
+            frame,
+            self.superpixels,
+            mask=mask,
+            color_map=color_map,
+        )
         self._latest_segments = result.segments
         self.frame_height, self.frame_width = result.frame.shape[:2]
         blended = self._compose_overlay(result)
