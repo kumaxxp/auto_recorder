@@ -7,7 +7,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from nicegui import app, ui
+from nicegui import ui
 
 from camera_stream import CameraStream
 from labeling import LABEL_COLORS, LabelManager, SegmentLabel
@@ -26,7 +26,7 @@ class SegmentationDashboard:
         self.camera = camera
         self.processor = processor
         self.labels = labels
-        self.superpixels = 200
+        self.superpixels = 120
         self.roi_y = 360
         self.frame_height = 480
         self.frame_width = 640
@@ -37,21 +37,23 @@ class SegmentationDashboard:
         self._mode_label: Optional[ui.label] = None
         self._slider_label: Optional[ui.label] = None
         self._dragging_roi = False
+        self._timer: Optional[ui.timer] = None
 
     def mount(self) -> None:
         with ui.row().classes("w-full items-start gap-6"):
             self._image_component = ui.interactive_image(
-                self._blank_src(), width=self.frame_width, height=self.frame_height
+                self._blank_src(),
+                size=(float(self.frame_width), float(self.frame_height)),
+                on_mouse=self._handle_mouse,
             )
-            self._image_component.on_mouse(self._handle_mouse)
             with ui.column().classes("w-72 gap-3"):
                 ui.label("Superpixel granularity")
                 self._slider_label = ui.label(self._slider_text())
                 ui.slider(
-                    min=10,
-                    max=500,
+                    min=40,
+                    max=400,
                     value=self.superpixels,
-                    step=10,
+                    step=20,
                     on_change=self._on_superpixel_change,
                 ).props("label-always")
                 ui.label("Labeling mode")
@@ -63,8 +65,8 @@ class SegmentationDashboard:
                 self._roi_label = ui.label(f"ROI cut line: {self.roi_y}px (right-drag to move)")
                 self._debug_label = ui.label("Metrics pending...")
 
-        ui.timer(0.1, self._update_frame)
-        app.on_shutdown(self.camera.stop)
+        self._timer = ui.timer(0.1, self._update_frame)
+
 
     def _on_superpixel_change(self, event) -> None:
         self.superpixels = int(event.value)

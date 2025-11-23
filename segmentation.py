@@ -21,7 +21,12 @@ class SegmentationResult:
 class SegmentationProcessor:
     """Applies fisheye correction and computes SLIC superpixels."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        downscale_factor: float = 0.5,
+        slic_compactness: float = 12.0,
+        slic_sigma: float = 1.0,
+    ) -> None:
         self.camera_matrix = np.array(
             [[320.0, 0.0, 320.0], [0.0, 320.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32
         )
@@ -29,6 +34,9 @@ class SegmentationProcessor:
         self._map1: Optional[np.ndarray] = None
         self._map2: Optional[np.ndarray] = None
         self._frame_size: Optional[Tuple[int, int]] = None
+        self.downscale_factor = downscale_factor
+        self.slic_compactness = slic_compactness
+        self.slic_sigma = slic_sigma
 
     def _ensure_maps(self, frame: np.ndarray) -> None:
         h, w = frame.shape[:2]
@@ -51,7 +59,27 @@ class SegmentationProcessor:
 
     def run(self, frame: np.ndarray, n_segments: int) -> SegmentationResult:
         undistorted = self.undistort(frame)
-        rgb = cv2.cvtColor(undistorted, cv2.COLOR_BGR2RGB)
-        segments = slic(img_as_float(rgb), n_segments=int(n_segments), compactness=10.0, start_label=1)
+        proc_frame = undistorted
+        scale = np.clip(self.downscale_factor, 0.1, 1.0)
+        if scale < 1.0:
+            new_w = max(1, int(undistorted.shape[1] * scale))
+            new_h = max(1, int(undistorted.shape[0] * scale))
+            proc_frame = cv2.resize(undistorted, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
+        segments_small = slic(
+            img_as_float(rgb),
+            n_segments=max(10, int(n_segments)),
+            compactness=self.slic_compactness,
+            sigma=self.slic_sigma,
+            start_label=1,
+        )
+        if proc_frame is not undistorted:
+            segments = cv2.resize(
+                segments_small.astype(np.int32),
+                (undistorted.shape[1], undistorted.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        else:
+            segments = segments_small
         boundaries = find_boundaries(segments, mode="inner")
         return SegmentationResult(frame=undistorted, segments=segments, boundaries=boundaries)

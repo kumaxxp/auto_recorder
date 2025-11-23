@@ -1,4 +1,4 @@
 nicegui>=2.0.0
-opencv-python>=4.9.0
-numpy>=1.24.0
+numpy>=1.24,<2.0
 scikit-image>=0.22.0
+git+https://github.com/NVIDIA-AI-IOT/jetcam@master#egg=jetcam
