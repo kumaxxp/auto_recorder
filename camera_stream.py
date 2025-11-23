@@ -417,11 +417,13 @@ class _GStreamerSegmentationBackend:
         pipeline_desc = (
             f"nvarguscamerasrc sensor-id={sensor_id} ! "
             f"video/x-raw(memory:NVMM), width={sensor_width}, height={sensor_height}, framerate={fps}/1 ! "
-            f"nvvidconv flip-method={flip_method} ! video/x-raw(memory:NVMM), format=RGBA ! "
-            "tee name=t "
-            "t. ! queue ! nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=rgbsink "
-            "t. ! queue ! nvinfer batch-size=1 unique-id=1 "
-            f"config-file-path={config} ! nvsegvisual width={mask_width} height={mask_height} ! "
+            f"nvvidconv flip-method={flip_method} ! video/x-raw(memory:NVMM), format=NV12 ! "
+            "tee name=rawtee "
+            "rawtee. ! queue ! nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=rgbsink "
+            "rawtee. ! queue ! nvvidconv ! video/x-raw(memory:NVMM), format=NV12 ! mux.sink_0 "
+            f"nvstreammux name=mux width={sensor_width} height={sensor_height} batch-size=1 live-source=1 enable-padding=0 ! "
+            f"nvinfer batch-size=1 unique-id=1 config-file-path={config} ! "
+            f"nvsegvisual width={mask_width} height={mask_height} ! "
             "nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=masksink"
         )
         pipeline = Gst.parse_launch(pipeline_desc)
@@ -434,19 +436,11 @@ class _GStreamerSegmentationBackend:
         mask_sample = self._mask_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
         rgb_sample = self._rgb_sink.emit("try-pull-sample", int(timeout * Gst.SECOND))
         if rgb_sample is None:
-            if mask_sample:
-                mask_sample.unref()
             return None
-        try:
-            frame = self._sample_to_ndarray(rgb_sample)
-        finally:
-            rgb_sample.unref()
+        frame = self._sample_to_ndarray(rgb_sample)
         mask = None
         if mask_sample is not None:
-            try:
-                mask = self._sample_to_ndarray(mask_sample)
-            finally:
-                mask_sample.unref()
+            mask = self._sample_to_ndarray(mask_sample)
         return frame, mask
 
     @staticmethod
