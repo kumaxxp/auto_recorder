@@ -445,8 +445,8 @@ class _GStreamerSegmentationBackend:
             "rawtee. ! queue ! mux.sink_0 "
             f"nvstreammux name=mux width={seg_width} height={seg_height} batch-size=1 live-source=1 enable-padding=0 ! "
                         f"nvinfer batch-size=1 unique-id=1 config-file-path={config} ! "
-                        f"nvsegvisual width={seg_width} height={seg_height} ! "
-                        "nvvidconv ! video/x-raw, format=RGBA ! videoconvert ! video/x-raw, format=BGR ! appsink name=masksink"
+            f"nvsegvisual width={seg_width} height={seg_height} ! "
+            "nvvidconv ! video/x-raw(memory:NVMM), format=RGBA ! nvvidconv ! video/x-raw, format=RGBA ! appsink name=masksink"
         )
         # Debug: print pipeline string
         # print(f"DEBUG: Pipeline string: {pipeline_desc}")
@@ -471,18 +471,26 @@ class _GStreamerSegmentationBackend:
         frame = self._sample_to_ndarray(rgb_sample, channels=3)
         mask = None
         if mask_sample is not None:
-            mask = self._sample_to_ndarray(mask_sample, channels=3)
+            mask = self._sample_to_ndarray(mask_sample)
         class_map = None
         if class_sample is not None:
             class_map = self._sample_to_ndarray(class_sample, channels=1)
         return frame, mask, class_map
 
     @staticmethod
-    def _sample_to_ndarray(sample, channels: int = 3) -> np.ndarray:
+    def _sample_to_ndarray(sample, channels: Optional[int] = None) -> np.ndarray:
         caps = sample.get_caps()
         structure = caps.get_structure(0)
         width = structure.get_value("width")
         height = structure.get_value("height")
+        fmt = structure.get_value("format")
+        if channels is None:
+            if fmt in {"RGBA", "BGRA"}:
+                channels = 4
+            elif fmt in {"GRAY8", "GRAY16_LE", "GRAY16_BE"}:
+                channels = 1
+            else:
+                channels = 3
         buffer = sample.get_buffer()
         success, map_info = buffer.map(Gst.MapFlags.READ)
         if not success:

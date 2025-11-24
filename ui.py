@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import queue
 import threading
 import time
 from typing import Optional
@@ -16,11 +17,15 @@ from labeling import LABEL_COLORS, LabelManager, Metrics, SegmentLabel
 from segmentation import SegmentationProcessor, SegmentationResult
 
 CITYSCAPES_DRIVABLE_CLASS_IDS = (3, 4)  # road, sidewalk
+ROI_Y_RATIO = 0.35
+DRIVABLE_STATUS_THRESHOLDS = (0.12, 0.01)
+STATUS_COLORS = {"GO": "#16a34a", "AVOID": "#f97316", "STOP": "#dc2626"}
 
 
 PHASE_A_RAW_PREVIEW = False  # Phase A diagnostics toggle; False restores overlay pipeline
 RAW_PREVIEW_FRAME_SKIP = 3  # Only used when Phase A diagnostics are active
-UI_REFRESH_INTERVAL_SEC = 1.0 / 30.0  # Target ~30 Hz UI refresh for overlay testing
+UI_REFRESH_INTERVAL_SEC = 1.0 / 30.0  # Timer cadence
+DISPLAY_TARGET_FPS = 10.0  # Desired NiceGUI refresh rate (seconds per JPEG ~100 ms)
 PROCESSING_SLEEP_SEC = 0.0  # Optional throttle for the background worker
 
 
@@ -37,9 +42,10 @@ class SegmentationDashboard:
         self.processor = processor
         self.labels = labels
         self.superpixels = 120
-        self.roi_y = 360
         self.frame_height = 480
         self.frame_width = 640
+        self.roi_y = self._default_roi_for_height(self.frame_height)
+        self._roi_manual_override = False
         self._latest_segments: Optional[np.ndarray] = None
         self._image_component: Optional[ui.interactive_image] = None
         self._debug_label: Optional[ui.label] = None
@@ -47,11 +53,9 @@ class SegmentationDashboard:
         self._mode_label: Optional[ui.label] = None
         self._slider_label: Optional[ui.label] = None
         self._perf_label: Optional[ui.label] = None
-        self._result_lock = threading.Lock()
+        self._status_label: Optional[ui.label] = None
+        self._result_queue: queue.Queue[SegmentationResult] = queue.Queue(maxsize=1)
         self._raw_lock = threading.Lock()
-        self._pending_result: Optional[SegmentationResult] = None
-        self._pending_serial = 0
-        self._rendered_serial = 0
         self._latest_raw_frame: Optional[np.ndarray] = None
         self._raw_serial = 0
         self._consumed_raw_serial = 0
@@ -63,9 +67,9 @@ class SegmentationDashboard:
         self._dragging_roi = False
         self._timer: Optional[ui.timer] = None
         self._drivable_class_ids = CITYSCAPES_DRIVABLE_CLASS_IDS
-        self._frame_counter = 0
         self._fps_counter = 0
         self._fps_window_start = time.time()
+        self._last_display_time = 0.0
 
     def mount(self) -> None:
         with ui.row().classes("w-full items-start gap-6"):
@@ -90,8 +94,10 @@ class SegmentationDashboard:
                     ui.button("BLOCKED", color="red", on_click=lambda: self._set_mode(SegmentLabel.BLOCKED))
                 ui.button("UNKNOWN", color="gray", on_click=lambda: self._set_mode(SegmentLabel.UNKNOWN))
                 self._mode_label = ui.label(f"Active: {self.labels.active_label.name}")
-                self._roi_label = ui.label(f"ROI cut line: {self.roi_y}px (right-drag to move)")
+                self._roi_label = ui.label("")
+                self._refresh_roi_label()
                 self._debug_label = ui.label("Metrics pending...")
+                self._status_label = ui.label("Status: STOP | drivable=0.00").classes("text-xl font-bold text-red-500")
 
         self._perf_label = ui.label("FPS pending...")
 
@@ -131,8 +137,38 @@ class SegmentationDashboard:
 
     def _update_roi(self, y_value: float) -> None:
         self.roi_y = int(np.clip(y_value, 0, self.frame_height - 1))
-        if self._roi_label:
-            self._roi_label.text = f"ROI cut line: {self.roi_y}px (right-drag to move)"
+        self._roi_manual_override = True
+        self._refresh_roi_label()
+
+    def _refresh_roi_label(self) -> None:
+        if not self._roi_label:
+            return
+        mode = "manual" if self._roi_manual_override else "auto"
+        self._roi_label.text = f"ROI cut line: {self.roi_y}px ({mode}, right-drag to move)"
+
+    def _default_roi_for_height(self, height: int) -> int:
+        if height <= 0:
+            return 0
+        cut_line = height - int(height * ROI_Y_RATIO)
+        return int(np.clip(cut_line, 0, height - 1))
+
+    def _sync_default_roi(self) -> None:
+        if self._roi_manual_override:
+            return
+        target = self._default_roi_for_height(self.frame_height)
+        if target != self.roi_y:
+            self.roi_y = target
+            self._refresh_roi_label()
+
+    def _ready_for_display(self) -> bool:
+        if DISPLAY_TARGET_FPS <= 0:
+            return True
+        min_interval = 1.0 / DISPLAY_TARGET_FPS
+        now = time.time()
+        if (now - self._last_display_time) >= min_interval:
+            self._last_display_time = now
+            return True
+        return False
 
     def _update_frame(self) -> None:
         if PHASE_A_RAW_PREVIEW:
@@ -140,6 +176,7 @@ class SegmentationDashboard:
             if frame is None:
                 return
             self.frame_height, self.frame_width = frame.shape[:2]
+            self._sync_default_roi()
             if self._image_component:
                 src = self._to_data_url(frame)
                 self._image_component.set_source(src)
@@ -150,24 +187,20 @@ class SegmentationDashboard:
         if result is None:
             return
         self.frame_height, self.frame_width = result.frame.shape[:2]
+        self._sync_default_roi()
         self._latest_segments = result.mask_classes if result.mask_classes is not None else result.segments
         if result.mask_overlay is not None:
             blended = self._compose_mask_overlay(result)
         else:
             blended = self._compose_overlay(result)
-        src = self._to_data_url(blended)
-        if self._image_component:
+        should_render = self._ready_for_display()
+        if should_render and self._image_component:
+            src = self._to_data_url(blended)
             self._image_component.set_source(src)
+            self._report_fps("PhaseC display")
         if result.mask_classes is not None:
             metrics = self._compute_mask_metrics(result.mask_classes)
-        else:
-            metrics = self.labels.compute_metrics(result.segments, self.roi_y)
-        self._report_fps("PhaseC display")
-        if self._debug_label:
-            self._debug_label.text = (
-                f"drivable_ratio={metrics.drivable_ratio:.2f} | "
-                f"left/right ratio={metrics.left_right_ratio:.2f} | decision={metrics.decision}"
-            )
+            self._update_status_label(metrics)
 
     def _compose_overlay(self, result) -> np.ndarray:
         overlay = self.labels.build_overlay(result.segments)
@@ -178,28 +211,69 @@ class SegmentationDashboard:
         return blended
 
     def _compose_mask_overlay(self, result: SegmentationResult) -> np.ndarray:
-        # DeepStream already outputs a colorized mask; blend it directly for clarity.
         overlay = result.mask_overlay
         if overlay is None:
             return result.frame
-        blended = cv2.addWeighted(result.frame, 0.6, overlay, 0.4, 0.0)
+        base = result.frame.astype(np.float32)
+        if overlay.shape[-1] == 4:
+            alpha = overlay[:, :, 3].astype(np.float32) / 255.0
+            mask_rgb = overlay[:, :, :3].astype(np.float32)
+        else:
+            alpha = np.full(overlay.shape[:2], 0.4, dtype=np.float32)
+            mask_rgb = overlay.astype(np.float32)
+        blended = base.copy()
+        mask = alpha > 0.0
+        if np.any(mask):
+            alpha_vals = alpha[mask][:, None]
+            blended[mask] = (1.0 - alpha_vals) * base[mask] + alpha_vals * mask_rgb[mask]
+        blended = blended.astype(np.uint8)
         y = int(np.clip(self.roi_y, 0, blended.shape[0] - 1))
         cv2.line(blended, (0, y), (blended.shape[1] - 1, y), (255, 255, 0), 2)
         return blended
 
     def _compute_mask_metrics(self, mask_classes: np.ndarray) -> Metrics:
-        roi = mask_classes[self.roi_y :, :]
+        h = mask_classes.shape[0]
+        roi_start = int(np.clip(self.roi_y, 0, h - 1))
+        roi = mask_classes[roi_start:, :]
         if roi.size == 0:
             return Metrics(0.0, 0.0, "STOP")
         drive_mask = np.isin(roi, self._drivable_class_ids)
         drivable_ratio = float(drive_mask.mean())
-        mid = roi.shape[1] // 2
-        left_drive = float(drive_mask[:, :mid].sum())
-        right_drive = float(drive_mask[:, mid:].sum())
-        right_norm = max(right_drive, 1.0)
-        left_right_ratio = left_drive / right_norm
-        decision = "GO" if drivable_ratio > 0.10 else "STOP"
-        return Metrics(drivable_ratio, left_right_ratio, decision)
+        go_thresh, avoid_thresh = DRIVABLE_STATUS_THRESHOLDS
+        if roi.shape[1] < 2:
+            left_right_balance = 0.0
+        else:
+            mid = roi.shape[1] // 2
+            left = drive_mask[:, :mid]
+            right = drive_mask[:, mid:]
+            left_ratio = float(left.sum()) / float(max(left.size, 1))
+            right_ratio = float(right.sum()) / float(max(right.size, 1))
+            left_right_balance = left_ratio - right_ratio
+        if drivable_ratio > go_thresh:
+            decision = "GO"
+        elif drivable_ratio > avoid_thresh:
+            decision = "AVOID"
+        else:
+            decision = "STOP"
+        return Metrics(drivable_ratio, left_right_balance, decision)
+
+    def _update_status_label(self, metrics: Metrics) -> None:
+        status_text = (
+            f"Status: {metrics.decision} | drivable={metrics.drivable_ratio:.2f} "
+            f"| L-R={metrics.left_right_ratio:+.2f}"
+        )
+        if self._status_label:
+            self._status_label.text = status_text
+            color = STATUS_COLORS.get(metrics.decision, "#e5e7eb")
+            self._status_label.style(f"color: {color}")
+        steer_hint = "CENTER"
+        if metrics.left_right_ratio > 0.05:
+            steer_hint = "LEFT"
+        elif metrics.left_right_ratio < -0.05:
+            steer_hint = "RIGHT"
+        if self._debug_label:
+            self._debug_label.text = f"ROI y={self.roi_y}px | steer={steer_hint}"
+        self._refresh_roi_label()
 
     @staticmethod
     def _to_data_url(image: np.ndarray) -> str:
@@ -275,17 +349,24 @@ class SegmentationDashboard:
                 time.sleep(PROCESSING_SLEEP_SEC)
 
     def _publish_result(self, result: SegmentationResult) -> None:
-        with self._result_lock:
-            self._pending_result = result
-            self._pending_serial += 1
+        try:
+            while True:
+                self._result_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._result_queue.put_nowait(result)
+        except queue.Full:
+            pass
 
     def _consume_latest_result(self) -> Optional[SegmentationResult]:
-        with self._result_lock:
-            if self._pending_result is None or self._pending_serial == self._rendered_serial:
-                return None
-            result = self._pending_result
-            self._rendered_serial = self._pending_serial
-        return result
+        latest: Optional[SegmentationResult] = None
+        try:
+            while True:
+                latest = self._result_queue.get_nowait()
+        except queue.Empty:
+            pass
+        return latest
 
     def _publish_raw_frame(self, frame: np.ndarray) -> None:
         with self._raw_lock:

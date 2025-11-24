@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from pathlib import Path
 
 from nicegui import app, ui
@@ -88,7 +89,11 @@ def main() -> None:
         app.on_shutdown(shutdown)
         _shutdown_registered = True
     if args.duration is not None and args.duration > 0:
-        ui.timer(args.duration, app.shutdown, once=True)
+        async def _auto_shutdown() -> None:
+            await asyncio.sleep(args.duration)
+            app.shutdown()
+
+        app.on_startup(_auto_shutdown)
     ui.run(title="RC Explorer Segmentation", reload=False, show=not args.no_browser)
 
 
