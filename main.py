@@ -20,6 +20,8 @@ from segmentation import (
     FrontObstacleMetrics,
     FusionStatus,
     SegmentationProcessor,
+    GeometryAnalysis,
+    compute_floor_wall_geometry,
     process_bottom_mask,
     process_front_mask,
 )
@@ -41,6 +43,9 @@ class FusionMonitor:
         drivable_ids: tuple[int, ...],
         interval: float = 0.05,
         front_hard_stop_ratio: float = 0.4,
+        floor_threshold: float = 0.04,
+        wall_threshold: float = 0.15,
+        geometry_conf_threshold: float = 0.45,
     ) -> None:
         self._bottom_camera = bottom_camera
         self._front_camera = front_camera
@@ -48,6 +53,9 @@ class FusionMonitor:
         self._drivable_ids = drivable_ids
         self._interval = interval
         self._front_hard_stop_ratio = front_hard_stop_ratio
+        self._floor_threshold = floor_threshold
+        self._wall_threshold = wall_threshold
+        self._geometry_conf_threshold = geometry_conf_threshold
         self._status: FusionStatus = FusionStatus()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -79,19 +87,33 @@ class FusionMonitor:
 
     def _compute_status(self) -> FusionStatus:
         roi = self._safe_roi()
+        frame = self._bottom_camera.read()
+        geometry = compute_floor_wall_geometry(
+            frame,
+            roi,
+            floor_threshold=self._floor_threshold,
+            wall_threshold=self._wall_threshold,
+        )
         bottom_mask = self._bottom_camera.read_mask_classes()
-        bottom_metrics = process_bottom_mask(bottom_mask, roi, self._drivable_ids)
+        bottom_metrics = process_bottom_mask(
+            bottom_mask,
+            roi,
+            self._drivable_ids,
+            geometry=geometry,
+        )
         front_mask = (
             self._front_camera.read_mask_classes() if self._front_camera is not None else None
         )
         front_metrics = process_front_mask(front_mask)
-        decision, warning = self._fuse_decision(bottom_metrics, front_metrics)
+        decision, warning = self._fuse_decision(bottom_metrics, front_metrics, geometry)
         return FusionStatus(
             bottom=bottom_metrics,
             front=front_metrics,
             decision=decision,
             warning=warning,
             timestamp=time.time(),
+            geometry_confidence=geometry.confidence,
+            geometry_active=geometry.floor_mask is not None,
         )
 
     def _safe_roi(self) -> int:
@@ -101,7 +123,10 @@ class FusionMonitor:
             return 0
 
     def _fuse_decision(
-        self, bottom: BottomROIMetrics, front: FrontObstacleMetrics
+        self,
+        bottom: BottomROIMetrics,
+        front: FrontObstacleMetrics,
+        geometry: GeometryAnalysis,
     ) -> tuple[str, str]:
         warning = "Front clear"
         decision = bottom.decision
@@ -111,6 +136,11 @@ class FusionMonitor:
                 decision = "STOP"
             elif decision == "GO":
                 decision = "AVOID"
+        elif geometry.floor_mask is not None and geometry.confidence < self._geometry_conf_threshold:
+            decision = "AVOID" if decision == "GO" else decision
+            warning = f"Low floor confidence {geometry.confidence:.2f}"
+        else:
+            warning = f"geometry={geometry.confidence:.2f}"
         return decision, warning
 
 

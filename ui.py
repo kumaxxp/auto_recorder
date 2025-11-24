@@ -30,6 +30,7 @@ RAW_PREVIEW_FRAME_SKIP = 3  # Only used when Phase A diagnostics are active
 UI_REFRESH_INTERVAL_SEC = 1.0 / 60.0  # Faster timer cadence for Phase D
 DISPLAY_TARGET_FPS = 40.0  # Target websocket stream rate (frames per second)
 PROCESSING_SLEEP_SEC = 0.0  # Optional throttle for the background worker
+FORCE_MASK_FULL_OVERLAY = False  # Debug flag; False restores video+mask blending
 
 STREAM_CLIENT_SCRIPT = """
 <script>
@@ -145,6 +146,7 @@ class SegmentationDashboard:
         self._fusion_decision_label: Optional[ui.label] = None
         self._fusion_bottom_label: Optional[ui.label] = None
         self._fusion_front_label: Optional[ui.label] = None
+        self._fusion_geometry_label: Optional[ui.label] = None
         self._roi_slider: Optional[ui.slider] = None
         self._canvas_container: Optional[ui.element] = None
         self._result_queue: queue.Queue[SegmentationResult] = queue.Queue(maxsize=1)
@@ -264,6 +266,7 @@ class SegmentationDashboard:
                     )
                     self._fusion_bottom_label = ui.label("Bottom ROI: --")
                     self._fusion_front_label = ui.label("Front obstacles: --")
+                    self._fusion_geometry_label = ui.label("Geometry: --")
 
     def _build_secondary_panel(self) -> None:
         if not self.secondary_stream_name or not self._secondary_canvas_id:
@@ -468,12 +471,15 @@ class SegmentationDashboard:
         overlay = result.mask_overlay
         if overlay is None:
             return result.frame
+        mask_rgb = overlay[:, :, :3] if overlay.shape[-1] >= 3 else overlay
+        if FORCE_MASK_FULL_OVERLAY:
+            return mask_rgb.astype(np.uint8).copy()
         base = result.frame.astype(np.uint16)
         if overlay.shape[-1] == 4:
             alpha = overlay[:, :, 3:4].astype(np.uint16)
             mask_rgb = overlay[:, :, :3].astype(np.uint16)
         else:
-            alpha = np.full(overlay.shape[:2] + (1,), 102, dtype=np.uint16)
+            alpha = np.full(overlay.shape[:2] + (1,), 220, dtype=np.uint16)
             mask_rgb = overlay.astype(np.uint16)
         inv_alpha = 255 - alpha
         blended = ((base * inv_alpha + mask_rgb * alpha) // 255).astype(np.uint8)
@@ -551,6 +557,21 @@ class SegmentationDashboard:
             )
             color = "#16a34a" if not status.front.detected else "#dc2626"
             self._fusion_front_label.style(f"color: {color}")
+        if self._fusion_geometry_label:
+            if status.geometry_active:
+                conf = status.geometry_confidence
+                text = f"Geometry: {conf:.2f} (floor/wall separation active)"
+                self._fusion_geometry_label.text = text
+                if conf >= 0.7:
+                    color = "#16a34a"
+                elif conf >= 0.45:
+                    color = "#f97316"
+                else:
+                    color = "#dc2626"
+                self._fusion_geometry_label.style(f"color: {color}")
+            else:
+                self._fusion_geometry_label.text = "Geometry: inactive"
+                self._fusion_geometry_label.style("color:#9ca3af")
 
     @staticmethod
     def _to_data_url(image: np.ndarray) -> str:
@@ -609,17 +630,16 @@ class SegmentationDashboard:
                 self._update_worker_fps()
                 continue
             mask_overlay = self.camera.read_mask()
-            mask_classes = getattr(self.camera, "read_mask_classes", lambda: None)()
-            if mask_overlay is not None and mask_classes is not None:
-                result = self._build_mask_result(frame, mask_overlay, mask_classes)
-            else:
-                color_map = self.camera.get_segmentation_color_map() if mask_overlay is not None else None
+            if mask_overlay is not None:
+                color_map = self.camera.get_segmentation_color_map()
                 result = self.processor.run(
                     frame,
                     self.superpixels,
                     mask=mask_overlay,
                     color_map=color_map,
                 )
+            else:
+                result = self._build_passthrough_result(frame)
             if self._ready_for_display():
                 display_frame = self._render_display_frame(result)
                 result.composited_frame = display_frame
@@ -684,4 +704,17 @@ class SegmentationDashboard:
             boundaries=boundaries,
             mask_overlay=overlay,
             mask_classes=mask_classes,
+        )
+
+    @staticmethod
+    def _build_passthrough_result(frame: np.ndarray) -> SegmentationResult:
+        height, width = frame.shape[:2]
+        empty_segments = np.zeros((height, width), dtype=np.int32)
+        empty_boundaries = np.zeros((height, width), dtype=bool)
+        return SegmentationResult(
+            frame=frame,
+            segments=empty_segments,
+            boundaries=empty_boundaries,
+            mask_overlay=None,
+            mask_classes=None,
         )

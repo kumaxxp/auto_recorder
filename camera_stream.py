@@ -573,7 +573,7 @@ class _GStreamerSegmentationBackend:
             "rawtee. ! queue ! mux.sink_0 "
             f"nvstreammux name=mux width={seg_width} height={seg_height} batch-size=1 live-source=1 enable-padding=0 ! "
                         f"nvinfer batch-size=1 unique-id=1 config-file-path={config} ! "
-            f"nvsegvisual width={seg_width} height={seg_height} ! "
+            f"nvsegvisual width={seg_width} height={seg_height} alpha=1.0 ! "
             "nvvidconv ! video/x-raw(memory:NVMM), format=RGBA ! nvvidconv ! video/x-raw, format=RGBA ! appsink name=masksink"
         )
         # Debug: print pipeline string

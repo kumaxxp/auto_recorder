@@ -26,12 +26,22 @@ class BottomROIMetrics:
     drivable_ratio: float
     left_right_diff: float
     decision: str
+    geometry_confidence: float = 1.0
+    geometry_active: bool = False
 
 
 @dataclass
 class FrontObstacleMetrics:
     obstacle_ratio: float
     detected: bool
+
+
+@dataclass
+class GeometryAnalysis:
+    floor_mask: Optional[np.ndarray]
+    wall_mask: Optional[np.ndarray]
+    confidence: float
+    wall_ratio: float
 
 
 CITYSCAPES_CLASS_NAME_BY_ID = {
@@ -92,6 +102,8 @@ class FusionStatus:
     decision: str = "INIT"
     warning: str = ""
     timestamp: float = 0.0
+    geometry_confidence: float = 0.0
+    geometry_active: bool = False
 
 
 def process_bottom_mask(
@@ -100,6 +112,7 @@ def process_bottom_mask(
     drivable_class_ids: Tuple[int, ...],
     go_threshold: float = 0.12,
     avoid_threshold: float = 0.01,
+    geometry: Optional[GeometryAnalysis] = None,
 ) -> BottomROIMetrics:
     if mask_classes is None or mask_classes.size == 0:
         return BottomROIMetrics(drivable_ratio=0.0, left_right_diff=0.0, decision="STOP")
@@ -109,6 +122,19 @@ def process_bottom_mask(
     if roi.size == 0:
         return BottomROIMetrics(drivable_ratio=0.0, left_right_diff=0.0, decision="STOP")
     drivable_mask = np.isin(roi, drivable_class_ids)
+    geometry_confidence = 1.0
+    geometry_active = False
+    if geometry and geometry.floor_mask is not None:
+        floor_mask = geometry.floor_mask
+        if floor_mask.shape != drivable_mask.shape:
+            floor_mask = cv2.resize(
+                floor_mask.astype(np.uint8),
+                (drivable_mask.shape[1], drivable_mask.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        drivable_mask = np.logical_and(drivable_mask, floor_mask)
+        geometry_confidence = geometry.confidence
+        geometry_active = True
     drivable_ratio = float(drivable_mask.mean())
     mid = roi.shape[1] // 2
     left_ratio = float(drivable_mask[:, :mid].mean()) if mid > 0 else drivable_ratio
@@ -124,6 +150,8 @@ def process_bottom_mask(
         drivable_ratio=drivable_ratio,
         left_right_diff=left_right_diff,
         decision=decision,
+        geometry_confidence=geometry_confidence,
+        geometry_active=geometry_active,
     )
 
 
@@ -145,6 +173,44 @@ def process_front_mask(
     obstacle_mask = np.isin(roi, obstacle_class_ids)
     ratio = float(obstacle_mask.mean())
     return FrontObstacleMetrics(obstacle_ratio=ratio, detected=ratio > detection_threshold)
+
+
+def compute_floor_wall_geometry(
+    frame: Optional[np.ndarray],
+    roi_y: int,
+    floor_threshold: float = 0.08,
+    wall_threshold: float = 0.18,
+    blur_kernel: int = 5,
+) -> GeometryAnalysis:
+    if frame is None or frame.size == 0:
+        return GeometryAnalysis(floor_mask=None, wall_mask=None, confidence=0.0, wall_ratio=0.0)
+    h = frame.shape[0]
+    roi_start = int(np.clip(roi_y, 0, h - 1))
+    roi = frame[roi_start:, :]
+    if roi.size == 0:
+        return GeometryAnalysis(floor_mask=None, wall_mask=None, confidence=0.0, wall_ratio=0.0)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    if blur_kernel >= 3:
+        ksize = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
+        gray = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    if mag.size == 0:
+        return GeometryAnalysis(floor_mask=None, wall_mask=None, confidence=0.0, wall_ratio=0.0)
+    mag_norm = np.zeros_like(mag)
+    if float(mag.max()) > 1e-6:
+        cv2.normalize(mag, mag_norm, 0.0, 1.0, cv2.NORM_MINMAX)
+    floor_mask = mag_norm <= floor_threshold
+    wall_mask = mag_norm >= wall_threshold
+    confidence = float(floor_mask.mean()) if floor_mask.size else 0.0
+    wall_ratio = float(wall_mask.mean()) if wall_mask.size else 0.0
+    return GeometryAnalysis(
+        floor_mask=floor_mask,
+        wall_mask=wall_mask,
+        confidence=confidence,
+        wall_ratio=wall_ratio,
+    )
 
 
 
