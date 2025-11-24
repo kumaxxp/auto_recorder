@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import platform
 import shlex
+import struct
 import sys
 import threading
 import time
@@ -13,9 +15,61 @@ from typing import Dict, Optional, Tuple
 import cv2
 import numpy as np
 
+from fastapi import WebSocket, WebSocketDisconnect
+
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class FramePublisher:
+    """Stores the latest 3-channel frame (BGR) and serves it over WebSockets."""
+
+    CHANNELS = 3
+
+    def __init__(self) -> None:
+        self._lock = threading.Condition()
+        self._latest_frame: Optional[bytes] = None
+        self._width = 0
+        self._height = 0
+        self._serial = 0
+
+    def publish(self, frame: np.ndarray) -> None:
+        if frame.ndim != 3 or frame.shape[2] != self.CHANNELS:
+            raise ValueError("FramePublisher expects RGB frames with 3 channels")
+        contiguous = np.ascontiguousarray(frame)
+        payload = contiguous.tobytes()
+        with self._lock:
+            self._latest_frame = payload
+            self._height, self._width = frame.shape[:2]
+            self._serial += 1
+            self._lock.notify_all()
+
+    def _wait_for_frame(self, last_serial: int, timeout: float = 1.0) -> Optional[Tuple[int, int, int, bytes]]:
+        with self._lock:
+            got_new = self._lock.wait_for(lambda: self._serial != last_serial and self._latest_frame is not None, timeout=timeout)
+            if not got_new or self._latest_frame is None:
+                return None
+            return self._serial, self._width, self._height, self._latest_frame
+
+    async def next_frame(self, last_serial: int) -> Optional[Tuple[int, int, int, bytes]]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._wait_for_frame, last_serial)
+
+    async def stream(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        last_serial = 0
+        try:
+            while True:
+                snapshot = await self.next_frame(last_serial)
+                if snapshot is None:
+                    continue
+                serial, width, height, data = snapshot
+                last_serial = serial
+                header = struct.pack("!III", width, height, self.CHANNELS)
+                await websocket.send_bytes(header + data)
+        except WebSocketDisconnect:
+            return
 
 try:  # Optional JetCam backend for Jetson CSI cameras
     from jetcam.csi_camera import CSICamera  # type: ignore

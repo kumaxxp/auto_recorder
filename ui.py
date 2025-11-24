@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from nicegui import ui
 
-from camera_stream import CameraStream
+from camera_stream import CameraStream, FramePublisher
 from labeling import LABEL_COLORS, LabelManager, Metrics, SegmentLabel
 from segmentation import SegmentationProcessor, SegmentationResult
 
@@ -24,36 +24,113 @@ STATUS_COLORS = {"GO": "#16a34a", "AVOID": "#f97316", "STOP": "#dc2626"}
 
 PHASE_A_RAW_PREVIEW = False  # Phase A diagnostics toggle; False restores overlay pipeline
 RAW_PREVIEW_FRAME_SKIP = 3  # Only used when Phase A diagnostics are active
-UI_REFRESH_INTERVAL_SEC = 1.0 / 30.0  # Timer cadence
-DISPLAY_TARGET_FPS = 10.0  # Desired NiceGUI refresh rate (seconds per JPEG ~100 ms)
+UI_REFRESH_INTERVAL_SEC = 1.0 / 60.0  # Faster timer cadence for Phase D
+DISPLAY_TARGET_FPS = 40.0  # Target websocket stream rate (frames per second)
 PROCESSING_SLEEP_SEC = 0.0  # Optional throttle for the background worker
+
+STREAM_CLIENT_SCRIPT = """
+<script>
+(function() {
+    if (window.__phaseDStreamReady) {
+        return;
+    }
+    window.__phaseDStreamReady = true;
+    window.startStreamCanvas = function(canvasId, endpoint) {
+        let socket = null;
+        let pending = null;
+        let ctx = null;
+        function draw(buffer) {
+            if (!buffer) {
+                return;
+            }
+            const view = new DataView(buffer);
+            const width = view.getUint32(0, false);
+            const height = view.getUint32(4, false);
+            const channels = view.getUint32(8, false) || 3;
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) {
+                return;
+            }
+            if (!ctx) {
+                ctx = canvas.getContext('2d');
+            }
+            if (canvas.width !== width || canvas.height !== height) {
+                canvas.width = width;
+                canvas.height = height;
+                canvas.style.width = width + 'px';
+                canvas.style.height = height + 'px';
+            }
+            const pixels = new Uint8Array(buffer, 12);
+            const rgba = new Uint8ClampedArray(width * height * 4);
+            for (let src = 0, dst = 0; src < pixels.length; src += channels, dst += 4) {
+                const b = pixels[src] || 0;
+                const g = pixels[src + 1] || 0;
+                const r = pixels[src + 2] || 0;
+                rgba[dst] = r;
+                rgba[dst + 1] = g;
+                rgba[dst + 2] = b;
+                rgba[dst + 3] = 255;
+            }
+            const image = new ImageData(rgba, width, height);
+            ctx.putImageData(image, 0, 0);
+        }
+        function renderLoop() {
+            if (pending) {
+                draw(pending);
+                pending = null;
+            }
+            window.requestAnimationFrame(renderLoop);
+        }
+        function connect() {
+            const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+            socket = new WebSocket(protocol + '://' + location.host + endpoint);
+            socket.binaryType = 'arraybuffer';
+            socket.onmessage = (event) => {
+                pending = event.data;
+            };
+            socket.onclose = () => {
+                setTimeout(connect, 1000);
+            };
+        }
+        connect();
+        renderLoop();
+    };
+})();
+</script>
+"""
 
 
 class SegmentationDashboard:
     """High-level controller wiring NiceGUI with processing logic."""
+
+    _stream_script_registered = False
 
     def __init__(
         self,
         camera: CameraStream,
         processor: SegmentationProcessor,
         labels: LabelManager,
+        frame_publisher: FramePublisher,
     ) -> None:
         self.camera = camera
         self.processor = processor
         self.labels = labels
+        self.frame_publisher = frame_publisher
         self.superpixels = 120
         self.frame_height = 480
         self.frame_width = 640
         self.roi_y = self._default_roi_for_height(self.frame_height)
         self._roi_manual_override = False
         self._latest_segments: Optional[np.ndarray] = None
-        self._image_component: Optional[ui.interactive_image] = None
+        self._interactive_overlay: Optional[ui.interactive_image] = None
         self._debug_label: Optional[ui.label] = None
         self._roi_label: Optional[ui.label] = None
         self._mode_label: Optional[ui.label] = None
         self._slider_label: Optional[ui.label] = None
         self._perf_label: Optional[ui.label] = None
         self._status_label: Optional[ui.label] = None
+        self._roi_slider: Optional[ui.slider] = None
+        self._canvas_container: Optional[ui.element] = None
         self._result_queue: queue.Queue[SegmentationResult] = queue.Queue(maxsize=1)
         self._raw_lock = threading.Lock()
         self._latest_raw_frame: Optional[np.ndarray] = None
@@ -70,14 +147,28 @@ class SegmentationDashboard:
         self._fps_counter = 0
         self._fps_window_start = time.time()
         self._last_display_time = 0.0
+        self._canvas_id = f"stream-canvas-{id(self)}"
+        self._overlay_shape = (self.frame_height, self.frame_width)
 
     def mount(self) -> None:
+        self._ensure_stream_script()
         with ui.row().classes("w-full items-start gap-6"):
-            self._image_component = ui.interactive_image(
-                self._blank_src(),
-                size=(float(self.frame_width), float(self.frame_height)),
-                on_mouse=self._handle_mouse,
-            )
+            with ui.column().classes("items-center"):
+                with ui.element("div").classes("relative inline-block").style(
+                    f"width:{self.frame_width}px;height:{self.frame_height}px"
+                ) as container:
+                    self._canvas_container = container
+                    ui.html(
+                        f'<canvas id="{self._canvas_id}" width="{self.frame_width}" height="{self.frame_height}" '
+                        'class="rounded-lg border border-gray-600 bg-black block"></canvas>',
+                        sanitize=False,
+                    )
+                    self._interactive_overlay = ui.interactive_image(
+                        self._blank_src(),
+                        size=(float(self.frame_width), float(self.frame_height)),
+                        on_mouse=self._handle_mouse,
+                    ).classes("absolute inset-0 opacity-0 cursor-crosshair").style("z-index: 5;")
+                ui.run_javascript(f"startStreamCanvas('{self._canvas_id}', '/stream');")
             with ui.column().classes("w-72 gap-3"):
                 ui.label("Superpixel granularity")
                 self._slider_label = ui.label(self._slider_text())
@@ -96,6 +187,15 @@ class SegmentationDashboard:
                 self._mode_label = ui.label(f"Active: {self.labels.active_label.name}")
                 self._roi_label = ui.label("")
                 self._refresh_roi_label()
+                self._roi_slider = ui.slider(
+                    min=0,
+                    max=self.frame_height,
+                    value=self.roi_y,
+                    step=5,
+                    on_change=self._on_roi_slider_change,
+                )
+                self._update_roi_slider_gui()
+                ui.button("Reset ROI auto", on_click=self._reset_roi_auto)
                 self._debug_label = ui.label("Metrics pending...")
                 self._status_label = ui.label("Status: STOP | drivable=0.00").classes("text-xl font-bold text-red-500")
 
@@ -104,11 +204,27 @@ class SegmentationDashboard:
         self._start_processing_worker()
         self._timer = ui.timer(UI_REFRESH_INTERVAL_SEC, self._update_frame)
 
+    @classmethod
+    def _ensure_stream_script(cls) -> None:
+        if cls._stream_script_registered:
+            return
+        ui.add_head_html(STREAM_CLIENT_SCRIPT)
+        cls._stream_script_registered = True
+
 
     def _on_superpixel_change(self, event) -> None:
         self.superpixels = int(event.value)
         if self._slider_label:
             self._slider_label.text = self._slider_text()
+
+    def _on_roi_slider_change(self, event) -> None:
+        self._roi_manual_override = True
+        self.roi_y = int(event.value)
+        self._refresh_roi_label()
+
+    def _reset_roi_auto(self) -> None:
+        self._roi_manual_override = False
+        self._sync_default_roi()
 
     def _set_mode(self, label: SegmentLabel) -> None:
         self.labels.set_active_label(label)
@@ -144,7 +260,8 @@ class SegmentationDashboard:
         if not self._roi_label:
             return
         mode = "manual" if self._roi_manual_override else "auto"
-        self._roi_label.text = f"ROI cut line: {self.roi_y}px ({mode}, right-drag to move)"
+        self._roi_label.text = f"ROI cut line: {self.roi_y}px ({mode}, use slider or drag)"
+        self._update_roi_slider_gui()
 
     def _default_roi_for_height(self, height: int) -> int:
         if height <= 0:
@@ -160,6 +277,32 @@ class SegmentationDashboard:
             self.roi_y = target
             self._refresh_roi_label()
 
+    def _sync_overlay_placeholder(self) -> None:
+        if not self._interactive_overlay:
+            return
+        if (self.frame_height, self.frame_width) == self._overlay_shape:
+            return
+        self._overlay_shape = (self.frame_height, self.frame_width)
+        blank = self._blank_src(self.frame_width, self.frame_height)
+        self._interactive_overlay.set_source(blank)
+        self._interactive_overlay.style(
+            f"width:{self.frame_width}px;height:{self.frame_height}px"
+        )
+        if self._canvas_container:
+            self._canvas_container.style(
+                f"width:{self.frame_width}px;height:{self.frame_height}px"
+            )
+        self._update_roi_slider_gui()
+
+    def _update_roi_slider_gui(self) -> None:
+        if not self._roi_slider:
+            return
+        try:
+            self._roi_slider.props(f"max={self.frame_height}")
+            self._roi_slider.value = self.roi_y
+        except AttributeError:
+            pass
+
     def _ready_for_display(self) -> bool:
         if DISPLAY_TARGET_FPS <= 0:
             return True
@@ -170,34 +313,36 @@ class SegmentationDashboard:
             return True
         return False
 
+    def _render_display_frame(self, result: SegmentationResult) -> np.ndarray:
+        if result.mask_overlay is not None:
+            return self._compose_mask_overlay(result)
+        return self._compose_overlay(result)
+
+    def _stream_frame(self, frame: Optional[np.ndarray]) -> None:
+        if frame is None or not self.frame_publisher:
+            return
+        self.frame_publisher.publish(frame)
+        self._report_fps("PhaseD display")
+
     def _update_frame(self) -> None:
         if PHASE_A_RAW_PREVIEW:
             frame = self._consume_raw_frame()
             if frame is None:
                 return
             self.frame_height, self.frame_width = frame.shape[:2]
+            self._sync_overlay_placeholder()
             self._sync_default_roi()
-            if self._image_component:
-                src = self._to_data_url(frame)
-                self._image_component.set_source(src)
-            self._report_fps("PhaseA raw preview")
+            if self._ready_for_display():
+                self._stream_frame(frame)
             return
 
         result = self._consume_latest_result()
         if result is None:
             return
         self.frame_height, self.frame_width = result.frame.shape[:2]
+        self._sync_overlay_placeholder()
         self._sync_default_roi()
         self._latest_segments = result.mask_classes if result.mask_classes is not None else result.segments
-        if result.mask_overlay is not None:
-            blended = self._compose_mask_overlay(result)
-        else:
-            blended = self._compose_overlay(result)
-        should_render = self._ready_for_display()
-        if should_render and self._image_component:
-            src = self._to_data_url(blended)
-            self._image_component.set_source(src)
-            self._report_fps("PhaseC display")
         if result.mask_classes is not None:
             metrics = self._compute_mask_metrics(result.mask_classes)
             self._update_status_label(metrics)
@@ -214,19 +359,15 @@ class SegmentationDashboard:
         overlay = result.mask_overlay
         if overlay is None:
             return result.frame
-        base = result.frame.astype(np.float32)
+        base = result.frame.astype(np.uint16)
         if overlay.shape[-1] == 4:
-            alpha = overlay[:, :, 3].astype(np.float32) / 255.0
-            mask_rgb = overlay[:, :, :3].astype(np.float32)
+            alpha = overlay[:, :, 3:4].astype(np.uint16)
+            mask_rgb = overlay[:, :, :3].astype(np.uint16)
         else:
-            alpha = np.full(overlay.shape[:2], 0.4, dtype=np.float32)
-            mask_rgb = overlay.astype(np.float32)
-        blended = base.copy()
-        mask = alpha > 0.0
-        if np.any(mask):
-            alpha_vals = alpha[mask][:, None]
-            blended[mask] = (1.0 - alpha_vals) * base[mask] + alpha_vals * mask_rgb[mask]
-        blended = blended.astype(np.uint8)
+            alpha = np.full(overlay.shape[:2] + (1,), 102, dtype=np.uint16)
+            mask_rgb = overlay.astype(np.uint16)
+        inv_alpha = 255 - alpha
+        blended = ((base * inv_alpha + mask_rgb * alpha) // 255).astype(np.uint8)
         y = int(np.clip(self.roi_y, 0, blended.shape[0] - 1))
         cv2.line(blended, (0, y), (blended.shape[1] - 1, y), (255, 255, 0), 2)
         return blended
@@ -284,9 +425,9 @@ class SegmentationDashboard:
         return f"data:image/jpeg;base64,{encoded}"
 
     @staticmethod
-    def _blank_src() -> str:
-        blank = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(blank, "Waiting for camera...", (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    def _blank_src(width: int = 640, height: int = 480) -> str:
+        blank = np.zeros((height, width, 3), dtype=np.uint8)
+        cv2.putText(blank, "Awaiting stream...", (20, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         return SegmentationDashboard._to_data_url(blank)
 
     def _report_fps(self, tag: str) -> None:
@@ -343,6 +484,12 @@ class SegmentationDashboard:
                     mask=mask_overlay,
                     color_map=color_map,
                 )
+            if self._ready_for_display():
+                display_frame = self._render_display_frame(result)
+                result.composited_frame = display_frame
+                self._stream_frame(display_frame)
+            else:
+                result.composited_frame = None
             self._publish_result(result)
             self._update_worker_fps()
             if PROCESSING_SLEEP_SEC > 0:

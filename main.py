@@ -6,9 +6,10 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from fastapi import WebSocket
 from nicegui import app, ui
 
-from camera_stream import CameraStream
+from camera_stream import CameraStream, FramePublisher
 from labeling import LabelManager
 from segmentation import SegmentationProcessor
 from ui import SegmentationDashboard
@@ -41,7 +42,8 @@ camera0 = CameraStream(
 )
 processor0 = SegmentationProcessor()
 labels0 = LabelManager()
-dashboard0 = SegmentationDashboard(camera0, processor0, labels0)
+frame_publisher = FramePublisher()
+dashboard0 = SegmentationDashboard(camera0, processor0, labels0, frame_publisher)
 
 camera1 = None
 dashboard1 = None
@@ -53,7 +55,7 @@ if ENABLE_DUAL_CAMERA:
     )
     processor1 = SegmentationProcessor()
     labels1 = LabelManager()
-    dashboard1 = SegmentationDashboard(camera1, processor1, labels1)
+    dashboard1 = SegmentationDashboard(camera1, processor1, labels1, frame_publisher)
 
 _shutdown_registered = False
 
@@ -68,6 +70,10 @@ def index_page() -> None:
             ui.separator().classes("my-4")
         ui.label("Camera 0 (Bottom)").classes("text-xl font-bold")
         dashboard0.mount()
+
+@app.websocket("/stream")
+async def stream_endpoint(websocket: WebSocket) -> None:
+    await frame_publisher.stream(websocket)
 
 
 def main() -> None:

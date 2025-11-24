@@ -18,6 +18,7 @@ class SegmentationResult:
     boundaries: np.ndarray
     mask_overlay: Optional[np.ndarray] = None
     mask_classes: Optional[np.ndarray] = None
+    composited_frame: Optional[np.ndarray] = None
 
 
 class SegmentationProcessor:
