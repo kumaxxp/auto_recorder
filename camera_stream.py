@@ -71,6 +71,29 @@ class FramePublisher:
         except WebSocketDisconnect:
             return
 
+
+class MultiFramePublisher:
+    """Manages a set of named FramePublisher instances."""
+
+    def __init__(self) -> None:
+        self._publishers: Dict[str, FramePublisher] = {}
+        self._lock = threading.Lock()
+
+    def get_or_create(self, name: str) -> FramePublisher:
+        with self._lock:
+            publisher = self._publishers.get(name)
+            if publisher is None:
+                publisher = FramePublisher()
+                self._publishers[name] = publisher
+            return publisher
+
+    def publish(self, name: str, frame: np.ndarray) -> None:
+        self.get_or_create(name).publish(frame)
+
+    async def stream(self, name: str, websocket: WebSocket) -> None:
+        publisher = self.get_or_create(name)
+        await publisher.stream(websocket)
+
 try:  # Optional JetCam backend for Jetson CSI cameras
     from jetcam.csi_camera import CSICamera  # type: ignore
 except ImportError:  # pragma: no cover - JetCam not required off Jetson

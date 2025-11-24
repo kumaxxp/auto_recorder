@@ -9,14 +9,14 @@ from pathlib import Path
 from fastapi import WebSocket
 from nicegui import app, ui
 
-from camera_stream import CameraStream, FramePublisher
+from camera_stream import CameraStream, MultiFramePublisher
 from labeling import LabelManager
 from segmentation import SegmentationProcessor
 from ui import SegmentationDashboard
 
 
 SEGMENTATION_CONFIG = Path("configs/deepstream_drivable_segmentation.txt")
-ENABLE_DUAL_CAMERA = False
+ENABLE_DUAL_CAMERA = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,8 +42,18 @@ camera0 = CameraStream(
 )
 processor0 = SegmentationProcessor()
 labels0 = LabelManager()
-frame_publisher = FramePublisher()
-dashboard0 = SegmentationDashboard(camera0, processor0, labels0, frame_publisher)
+frame_publishers = MultiFramePublisher()
+secondary_stream = "front" if ENABLE_DUAL_CAMERA else None
+dashboard0 = SegmentationDashboard(
+    camera0,
+    processor0,
+    labels0,
+    frame_publishers,
+    "bottom",
+    secondary_stream_name=secondary_stream,
+    secondary_stream_label="Camera 1 (Front)",
+    title="Camera 0 (Bottom)",
+)
 
 camera1 = None
 dashboard1 = None
@@ -55,7 +65,14 @@ if ENABLE_DUAL_CAMERA:
     )
     processor1 = SegmentationProcessor()
     labels1 = LabelManager()
-    dashboard1 = SegmentationDashboard(camera1, processor1, labels1, frame_publisher)
+    dashboard1 = SegmentationDashboard(
+        camera1,
+        processor1,
+        labels1,
+        frame_publishers,
+        "front",
+        title="Camera 1 (Front)",
+    )
 
 _shutdown_registered = False
 
@@ -64,16 +81,11 @@ _shutdown_registered = False
 def index_page() -> None:
     """Render the dashboard for incoming requests."""
     with ui.column().classes("w-full items-center"):
-        if ENABLE_DUAL_CAMERA and dashboard1:
-            ui.label("Camera 1 (Top)").classes("text-xl font-bold")
-            dashboard1.mount()
-            ui.separator().classes("my-4")
-        ui.label("Camera 0 (Bottom)").classes("text-xl font-bold")
         dashboard0.mount()
 
-@app.websocket("/stream")
-async def stream_endpoint(websocket: WebSocket) -> None:
-    await frame_publisher.stream(websocket)
+@app.websocket("/stream/{stream_name}")
+async def stream_endpoint(websocket: WebSocket, stream_name: str) -> None:
+    await frame_publishers.stream(stream_name, websocket)
 
 
 def main() -> None:
@@ -84,6 +96,8 @@ def main() -> None:
         camera0.start()
     if ENABLE_DUAL_CAMERA and camera1 and not camera1.is_running():
         camera1.start()
+        if dashboard1:
+            dashboard1.start_processing_only()
         
     if not _shutdown_registered:
         def shutdown():

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from nicegui import ui
 
-from camera_stream import CameraStream, FramePublisher
+from camera_stream import CameraStream, MultiFramePublisher
 from labeling import LABEL_COLORS, LabelManager, Metrics, SegmentLabel
 from segmentation import SegmentationProcessor, SegmentationResult
 
@@ -110,12 +110,20 @@ class SegmentationDashboard:
         camera: CameraStream,
         processor: SegmentationProcessor,
         labels: LabelManager,
-        frame_publisher: FramePublisher,
+        frame_publisher: MultiFramePublisher,
+        stream_name: str,
+        secondary_stream_name: Optional[str] = None,
+        secondary_stream_label: str = "Camera 1 (Front)",
+        title: str = "Camera 0 (Bottom)",
     ) -> None:
         self.camera = camera
         self.processor = processor
         self.labels = labels
         self.frame_publisher = frame_publisher
+        self.stream_name = stream_name
+        self.secondary_stream_name = secondary_stream_name
+        self.secondary_stream_label = secondary_stream_label
+        self.title = title
         self.superpixels = 120
         self.frame_height = 480
         self.frame_width = 640
@@ -148,12 +156,50 @@ class SegmentationDashboard:
         self._fps_window_start = time.time()
         self._last_display_time = 0.0
         self._canvas_id = f"stream-canvas-{id(self)}"
+        self._secondary_canvas_id = (
+            f"stream-canvas-secondary-{id(self)}" if self.secondary_stream_name else None
+        )
         self._overlay_shape = (self.frame_height, self.frame_width)
+        self._layout_mode = "stack"
+        self._layout_container: Optional[ui.element] = None
+        self._layout_toggle: Optional[ui.toggle] = None
 
     def mount(self) -> None:
         self._ensure_stream_script()
-        with ui.row().classes("w-full items-start gap-6"):
-            with ui.column().classes("items-center"):
+        with ui.column().classes("w-full gap-4"):
+            if self.secondary_stream_name:
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("デュアルカメラビュー").classes("text-xl font-bold")
+                    self._layout_toggle = ui.toggle(
+                        {"stack": "縦配置", "side": "横配置"},
+                        value=self._layout_mode,
+                        on_change=self._on_layout_toggle,
+                    )
+            else:
+                ui.label(self.title).classes("text-xl font-bold")
+
+            self._layout_container = ui.element("div").classes(
+                "w-full flex flex-wrap gap-6 items-start justify-center"
+            )
+            container = self._layout_container
+            self._apply_layout_mode()
+            with container:
+                self._build_primary_panel()
+                if self.secondary_stream_name:
+                    self._build_secondary_panel()
+
+        self._start_processing_worker()
+        self._timer = ui.timer(UI_REFRESH_INTERVAL_SEC, self._update_frame)
+
+    def start_processing_only(self) -> None:
+        self._start_processing_worker()
+
+    def _build_primary_panel(self) -> None:
+        with ui.element("div").classes(
+            "flex flex-wrap gap-6 items-start justify-center max-w-screen-xl"
+        ):
+            with ui.column().classes("items-center gap-3"):
+                ui.label(self.title).classes("text-lg font-semibold")
                 with ui.element("div").classes("relative inline-block").style(
                     f"width:{self.frame_width}px;height:{self.frame_height}px"
                 ) as container:
@@ -168,7 +214,8 @@ class SegmentationDashboard:
                         size=(float(self.frame_width), float(self.frame_height)),
                         on_mouse=self._handle_mouse,
                     ).classes("absolute inset-0 opacity-0 cursor-crosshair").style("z-index: 5;")
-                ui.run_javascript(f"startStreamCanvas('{self._canvas_id}', '/stream');")
+                endpoint = f"/stream/{self.stream_name}"
+                ui.run_javascript(f"startStreamCanvas('{self._canvas_id}', '{endpoint}');")
             with ui.column().classes("w-72 gap-3"):
                 ui.label("Superpixel granularity")
                 self._slider_label = ui.label(self._slider_text())
@@ -197,12 +244,45 @@ class SegmentationDashboard:
                 self._update_roi_slider_gui()
                 ui.button("Reset ROI auto", on_click=self._reset_roi_auto)
                 self._debug_label = ui.label("Metrics pending...")
-                self._status_label = ui.label("Status: STOP | drivable=0.00").classes("text-xl font-bold text-red-500")
+                self._status_label = ui.label("Status: STOP | drivable=0.00").classes(
+                    "text-xl font-bold text-red-500"
+                )
+                self._perf_label = ui.label("FPS pending...")
 
-        self._perf_label = ui.label("FPS pending...")
+    def _build_secondary_panel(self) -> None:
+        if not self.secondary_stream_name or not self._secondary_canvas_id:
+            return
+        with ui.column().classes("items-center gap-3"):
+            ui.label(self.secondary_stream_label).classes("text-lg font-semibold")
+            with ui.element("div").classes("relative inline-block").style(
+                f"width:{self.frame_width}px;height:{self.frame_height}px"
+            ):
+                ui.html(
+                    f'<canvas id="{self._secondary_canvas_id}" width="{self.frame_width}" height="{self.frame_height}" '
+                    'class="rounded-lg border border-gray-600 bg-black block"></canvas>',
+                    sanitize=False,
+                )
+            endpoint = f"/stream/{self.secondary_stream_name}"
+            ui.run_javascript(
+                f"startStreamCanvas('{self._secondary_canvas_id}', '{endpoint}');"
+            )
+            ui.label("表示専用 (ROI操作なし)").classes("text-sm text-gray-400")
 
-        self._start_processing_worker()
-        self._timer = ui.timer(UI_REFRESH_INTERVAL_SEC, self._update_frame)
+    def _on_layout_toggle(self, event) -> None:
+        value = getattr(event, "value", None) or "stack"
+        if value not in {"stack", "side"}:
+            value = "stack"
+        self._layout_mode = value
+        self._apply_layout_mode()
+
+    def _apply_layout_mode(self) -> None:
+        if not self._layout_container:
+            return
+        direction = "column" if self._layout_mode == "stack" else "row"
+        self._layout_container.style(
+            "display:flex;flex-wrap:wrap;gap:24px;width:100%;justify-content:center;"
+            f"align-items:flex-start;flex-direction:{direction};"
+        )
 
     @classmethod
     def _ensure_stream_script(cls) -> None:
@@ -321,7 +401,7 @@ class SegmentationDashboard:
     def _stream_frame(self, frame: Optional[np.ndarray]) -> None:
         if frame is None or not self.frame_publisher:
             return
-        self.frame_publisher.publish(frame)
+        self.frame_publisher.publish(self.stream_name, frame)
         self._report_fps("PhaseD display")
 
     def _update_frame(self) -> None:
