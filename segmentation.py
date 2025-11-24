@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -19,6 +19,133 @@ class SegmentationResult:
     mask_overlay: Optional[np.ndarray] = None
     mask_classes: Optional[np.ndarray] = None
     composited_frame: Optional[np.ndarray] = None
+
+
+@dataclass
+class BottomROIMetrics:
+    drivable_ratio: float
+    left_right_diff: float
+    decision: str
+
+
+@dataclass
+class FrontObstacleMetrics:
+    obstacle_ratio: float
+    detected: bool
+
+
+CITYSCAPES_CLASS_NAME_BY_ID = {
+    0: "road",
+    1: "sidewalk",
+    2: "building",
+    3: "wall",
+    4: "fence",
+    5: "pole",
+    6: "traffic light",
+    7: "traffic sign",
+    8: "vegetation",
+    9: "terrain",
+    10: "sky",
+    11: "person",
+    12: "rider",
+    13: "car",
+    14: "truck",
+    15: "bus",
+    16: "train",
+    17: "motorcycle",
+    18: "bicycle",
+    19: "void",
+    20: "background",
+}
+
+CITYSCAPES_NAME_TO_ID = {name: idx for idx, name in CITYSCAPES_CLASS_NAME_BY_ID.items()}
+
+DRIVABLE_CLASS_NAMES = ("road", "sidewalk")
+CITYSCAPES_DRIVABLE_CLASS_IDS = tuple(
+    CITYSCAPES_NAME_TO_ID[name]
+    for name in DRIVABLE_CLASS_NAMES
+    if name in CITYSCAPES_NAME_TO_ID
+)
+
+OBSTACLE_CLASS_IDS = tuple(
+    CITYSCAPES_NAME_TO_ID[name]
+    for name in ("car", "person", "wall", "building", "truck", "bus")
+    if name in CITYSCAPES_NAME_TO_ID
+)
+
+
+@dataclass
+class FusionStatus:
+    bottom: BottomROIMetrics = field(
+        default_factory=lambda: BottomROIMetrics(
+            drivable_ratio=0.0,
+            left_right_diff=0.0,
+            decision="STOP",
+        )
+    )
+    front: FrontObstacleMetrics = field(
+        default_factory=lambda: FrontObstacleMetrics(
+            obstacle_ratio=0.0,
+            detected=False,
+        )
+    )
+    decision: str = "INIT"
+    warning: str = ""
+    timestamp: float = 0.0
+
+
+def process_bottom_mask(
+    mask_classes: Optional[np.ndarray],
+    roi_y: int,
+    drivable_class_ids: Tuple[int, ...],
+    go_threshold: float = 0.12,
+    avoid_threshold: float = 0.01,
+) -> BottomROIMetrics:
+    if mask_classes is None or mask_classes.size == 0:
+        return BottomROIMetrics(drivable_ratio=0.0, left_right_diff=0.0, decision="STOP")
+    h = mask_classes.shape[0]
+    roi_start = int(np.clip(roi_y, 0, h - 1))
+    roi = mask_classes[roi_start:, :]
+    if roi.size == 0:
+        return BottomROIMetrics(drivable_ratio=0.0, left_right_diff=0.0, decision="STOP")
+    drivable_mask = np.isin(roi, drivable_class_ids)
+    drivable_ratio = float(drivable_mask.mean())
+    mid = roi.shape[1] // 2
+    left_ratio = float(drivable_mask[:, :mid].mean()) if mid > 0 else drivable_ratio
+    right_ratio = float(drivable_mask[:, mid:].mean()) if mid > 0 else drivable_ratio
+    left_right_diff = left_ratio - right_ratio
+    if drivable_ratio > go_threshold:
+        decision = "GO"
+    elif drivable_ratio > avoid_threshold:
+        decision = "AVOID"
+    else:
+        decision = "STOP"
+    return BottomROIMetrics(
+        drivable_ratio=drivable_ratio,
+        left_right_diff=left_right_diff,
+        decision=decision,
+    )
+
+
+def process_front_mask(
+    mask_classes: Optional[np.ndarray],
+    central_width_ratio: float = 0.25,
+    obstacle_class_ids: Tuple[int, ...] = OBSTACLE_CLASS_IDS,
+    detection_threshold: float = 0.15,
+) -> FrontObstacleMetrics:
+    if mask_classes is None or mask_classes.size == 0:
+        return FrontObstacleMetrics(obstacle_ratio=0.0, detected=False)
+    h, w = mask_classes.shape
+    roi_width = max(1, int(w * central_width_ratio))
+    start_x = max(0, (w - roi_width) // 2)
+    end_x = min(w, start_x + roi_width)
+    roi = mask_classes[:, start_x:end_x]
+    if roi.size == 0 or not obstacle_class_ids:
+        return FrontObstacleMetrics(obstacle_ratio=0.0, detected=False)
+    obstacle_mask = np.isin(roi, obstacle_class_ids)
+    ratio = float(obstacle_mask.mean())
+    return FrontObstacleMetrics(obstacle_ratio=ratio, detected=ratio > detection_threshold)
+
 
 
 class SegmentationProcessor:

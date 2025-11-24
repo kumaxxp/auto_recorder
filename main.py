@@ -4,19 +4,114 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import threading
+import time
 from pathlib import Path
+from typing import Callable, Optional
 
 from fastapi import WebSocket
 from nicegui import app, ui
 
-from camera_stream import CameraStream, MultiFramePublisher
+from camera_stream import CameraStream, DualDeepStreamPipelines, MultiFramePublisher
 from labeling import LabelManager
-from segmentation import SegmentationProcessor
+from segmentation import (
+    CITYSCAPES_DRIVABLE_CLASS_IDS,
+    BottomROIMetrics,
+    FrontObstacleMetrics,
+    FusionStatus,
+    SegmentationProcessor,
+    process_bottom_mask,
+    process_front_mask,
+)
 from ui import SegmentationDashboard
 
 
 SEGMENTATION_CONFIG = Path("configs/deepstream_drivable_segmentation.txt")
 ENABLE_DUAL_CAMERA = True
+
+
+class FusionMonitor:
+    """Continuously fuses bottom/front ROI telemetry on a worker thread."""
+
+    def __init__(
+        self,
+        bottom_camera: CameraStream,
+        front_camera: Optional[CameraStream],
+        roi_getter: Callable[[], int],
+        drivable_ids: tuple[int, ...],
+        interval: float = 0.05,
+        front_hard_stop_ratio: float = 0.4,
+    ) -> None:
+        self._bottom_camera = bottom_camera
+        self._front_camera = front_camera
+        self._roi_getter = roi_getter
+        self._drivable_ids = drivable_ids
+        self._interval = interval
+        self._front_hard_stop_ratio = front_hard_stop_ratio
+        self._status: FusionStatus = FusionStatus()
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def latest(self) -> FusionStatus:
+        with self._lock:
+            return self._status
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            status = self._compute_status()
+            with self._lock:
+                self._status = status
+            time.sleep(self._interval)
+
+    def _compute_status(self) -> FusionStatus:
+        roi = self._safe_roi()
+        bottom_mask = self._bottom_camera.read_mask_classes()
+        bottom_metrics = process_bottom_mask(bottom_mask, roi, self._drivable_ids)
+        front_mask = (
+            self._front_camera.read_mask_classes() if self._front_camera is not None else None
+        )
+        front_metrics = process_front_mask(front_mask)
+        decision, warning = self._fuse_decision(bottom_metrics, front_metrics)
+        return FusionStatus(
+            bottom=bottom_metrics,
+            front=front_metrics,
+            decision=decision,
+            warning=warning,
+            timestamp=time.time(),
+        )
+
+    def _safe_roi(self) -> int:
+        try:
+            return int(self._roi_getter())
+        except Exception:
+            return 0
+
+    def _fuse_decision(
+        self, bottom: BottomROIMetrics, front: FrontObstacleMetrics
+    ) -> tuple[str, str]:
+        warning = "Front clear"
+        decision = bottom.decision
+        if front.detected:
+            warning = f"Obstacle {front.obstacle_ratio * 100:.1f}% center"
+            if front.obstacle_ratio >= self._front_hard_stop_ratio or decision == "STOP":
+                decision = "STOP"
+            elif decision == "GO":
+                decision = "AVOID"
+        return decision, warning
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,16 +129,45 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-# Initialize Camera 0 (Bottom)
-camera0 = CameraStream(
-    index=0,
-    use_gstreamer_segmentation=SEGMENTATION_CONFIG.exists(),
-    gstreamer_segmentation_config=str(SEGMENTATION_CONFIG),
-)
+def _create_cameras() -> tuple[CameraStream, Optional[CameraStream], Optional[DualDeepStreamPipelines]]:
+    if ENABLE_DUAL_CAMERA and SEGMENTATION_CONFIG.exists():
+        try:
+            pipelines = DualDeepStreamPipelines(
+                bottom_index=0,
+                front_index=1,
+                config_path=SEGMENTATION_CONFIG,
+            )
+            return pipelines.pipeline_bottom, pipelines.pipeline_front, pipelines
+        except FileNotFoundError:
+            pass
+    bottom = CameraStream(
+        index=0,
+        use_gstreamer_segmentation=SEGMENTATION_CONFIG.exists(),
+        gstreamer_segmentation_config=str(SEGMENTATION_CONFIG),
+    )
+    front = None
+    if ENABLE_DUAL_CAMERA:
+        front = CameraStream(
+            index=1,
+            use_gstreamer_segmentation=SEGMENTATION_CONFIG.exists(),
+            gstreamer_segmentation_config=str(SEGMENTATION_CONFIG),
+        )
+    return bottom, front, None
+
+
+camera0, camera1, dual_pipelines = _create_cameras()
 processor0 = SegmentationProcessor()
 labels0 = LabelManager()
 frame_publishers = MultiFramePublisher()
-secondary_stream = "front" if ENABLE_DUAL_CAMERA else None
+secondary_stream = "front" if camera1 else None
+
+fusion_monitor: Optional[FusionMonitor] = None
+
+
+def _fusion_status_provider() -> Optional[FusionStatus]:
+    return fusion_monitor.latest() if fusion_monitor else None
+
+
 dashboard0 = SegmentationDashboard(
     camera0,
     processor0,
@@ -53,16 +177,11 @@ dashboard0 = SegmentationDashboard(
     secondary_stream_name=secondary_stream,
     secondary_stream_label="Camera 1 (Front)",
     title="Camera 0 (Bottom)",
+    fusion_status_provider=_fusion_status_provider if camera1 else None,
 )
 
-camera1 = None
 dashboard1 = None
-if ENABLE_DUAL_CAMERA:
-    camera1 = CameraStream(
-        index=1,
-        use_gstreamer_segmentation=SEGMENTATION_CONFIG.exists(),
-        gstreamer_segmentation_config=str(SEGMENTATION_CONFIG),
-    )
+if camera1:
     processor1 = SegmentationProcessor()
     labels1 = LabelManager()
     dashboard1 = SegmentationDashboard(
@@ -73,6 +192,21 @@ if ENABLE_DUAL_CAMERA:
         "front",
         title="Camera 1 (Front)",
     )
+
+
+def _ensure_fusion_monitor() -> None:
+    global fusion_monitor
+    if fusion_monitor or camera1 is None:
+        return
+    roi_getter = lambda: getattr(dashboard0, "roi_y", 0)
+    fusion_monitor = FusionMonitor(
+        bottom_camera=camera0,
+        front_camera=camera1,
+        roi_getter=roi_getter,
+        drivable_ids=CITYSCAPES_DRIVABLE_CLASS_IDS,
+    )
+    fusion_monitor.start()
+
 
 _shutdown_registered = False
 
@@ -92,20 +226,30 @@ def main() -> None:
     args = parse_args()
     global _shutdown_registered
     # Start both cameras
-    if not camera0.is_running():
-        camera0.start()
-    if ENABLE_DUAL_CAMERA and camera1 and not camera1.is_running():
-        camera1.start()
-        if dashboard1:
-            dashboard1.start_processing_only()
+    if dual_pipelines:
+        dual_pipelines.start()
+    else:
+        if not camera0.is_running():
+            camera0.start()
+        if camera1 and not camera1.is_running():
+            camera1.start()
+    if dashboard1:
+        dashboard1.start_processing_only()
+    _ensure_fusion_monitor()
         
     if not _shutdown_registered:
         def shutdown():
             dashboard0.shutdown()
-            camera0.stop()
-            if ENABLE_DUAL_CAMERA and camera1 and dashboard1:
+            if dashboard1:
                 dashboard1.shutdown()
-                camera1.stop()
+            if fusion_monitor:
+                fusion_monitor.stop()
+            if dual_pipelines:
+                dual_pipelines.stop()
+            else:
+                camera0.stop()
+                if camera1:
+                    camera1.stop()
         app.on_shutdown(shutdown)
         _shutdown_registered = True
     if args.duration is not None and args.duration > 0:

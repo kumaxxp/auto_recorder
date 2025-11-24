@@ -454,6 +454,57 @@ class CameraStream:
         return True
 
 
+class DualDeepStreamPipelines:
+    """Bootstraps two independent DeepStream segmentation pipelines.
+
+    This helper guarantees that bottom/front cameras each receive their own
+    ``nvinfer`` instance while sharing the same configuration file. It can be
+    used by higher layers to start/stop both feeds together and exposes the
+    underlying ``CameraStream`` objects via ``pipeline_bottom`` and
+    ``pipeline_front`` attributes.
+    """
+
+    def __init__(
+        self,
+        bottom_index: int,
+        front_index: int,
+        config_path: Path,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+        sensor_width: Optional[int] = None,
+        sensor_height: Optional[int] = None,
+        flip_method: int = 0,
+    ) -> None:
+        if not config_path.exists():
+            raise FileNotFoundError(f"DeepStream config not found: {config_path}")
+        shared_kwargs = dict(
+            width=width,
+            height=height,
+            fps=fps,
+            prefer_jetson_pipeline=True,
+            sensor_width=sensor_width,
+            sensor_height=sensor_height,
+            flip_method=flip_method,
+            use_gstreamer_segmentation=True,
+            gstreamer_segmentation_config=str(config_path),
+        )
+        self.pipeline_bottom = CameraStream(index=bottom_index, **shared_kwargs)
+        self.pipeline_front = CameraStream(index=front_index, **shared_kwargs)
+
+    def start(self) -> None:
+        if not self.pipeline_bottom.is_running():
+            self.pipeline_bottom.start()
+        if not self.pipeline_front.is_running():
+            self.pipeline_front.start()
+
+    def stop(self) -> None:
+        self.pipeline_bottom.stop()
+        self.pipeline_front.stop()
+
+    def is_running(self) -> bool:
+        return self.pipeline_bottom.is_running() and self.pipeline_front.is_running()
+
 class _GStreamerSegmentationBackend:
     """Runs a DeepStream-powered segmentation pipeline and surfaces frames."""
 

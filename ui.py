@@ -6,7 +6,7 @@ import base64
 import queue
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -14,9 +14,12 @@ from nicegui import ui
 
 from camera_stream import CameraStream, MultiFramePublisher
 from labeling import LABEL_COLORS, LabelManager, Metrics, SegmentLabel
-from segmentation import SegmentationProcessor, SegmentationResult
-
-CITYSCAPES_DRIVABLE_CLASS_IDS = (3, 4)  # road, sidewalk
+from segmentation import (
+    SegmentationProcessor,
+    SegmentationResult,
+    CITYSCAPES_DRIVABLE_CLASS_IDS,
+    FusionStatus,
+)
 ROI_Y_RATIO = 0.35
 DRIVABLE_STATUS_THRESHOLDS = (0.12, 0.01)
 STATUS_COLORS = {"GO": "#16a34a", "AVOID": "#f97316", "STOP": "#dc2626"}
@@ -115,6 +118,7 @@ class SegmentationDashboard:
         secondary_stream_name: Optional[str] = None,
         secondary_stream_label: str = "Camera 1 (Front)",
         title: str = "Camera 0 (Bottom)",
+        fusion_status_provider: Optional[Callable[[], Optional[FusionStatus]]] = None,
     ) -> None:
         self.camera = camera
         self.processor = processor
@@ -124,6 +128,7 @@ class SegmentationDashboard:
         self.secondary_stream_name = secondary_stream_name
         self.secondary_stream_label = secondary_stream_label
         self.title = title
+        self._fusion_status_provider = fusion_status_provider
         self.superpixels = 120
         self.frame_height = 480
         self.frame_width = 640
@@ -137,6 +142,9 @@ class SegmentationDashboard:
         self._slider_label: Optional[ui.label] = None
         self._perf_label: Optional[ui.label] = None
         self._status_label: Optional[ui.label] = None
+        self._fusion_decision_label: Optional[ui.label] = None
+        self._fusion_bottom_label: Optional[ui.label] = None
+        self._fusion_front_label: Optional[ui.label] = None
         self._roi_slider: Optional[ui.slider] = None
         self._canvas_container: Optional[ui.element] = None
         self._result_queue: queue.Queue[SegmentationResult] = queue.Queue(maxsize=1)
@@ -248,6 +256,14 @@ class SegmentationDashboard:
                     "text-xl font-bold text-red-500"
                 )
                 self._perf_label = ui.label("FPS pending...")
+                if self._fusion_status_provider:
+                    ui.separator()
+                    ui.label("Fusion Telemetry").classes("text-base font-semibold")
+                    self._fusion_decision_label = ui.label("Fusion: pending").classes(
+                        "font-semibold"
+                    )
+                    self._fusion_bottom_label = ui.label("Bottom ROI: --")
+                    self._fusion_front_label = ui.label("Front obstacles: --")
 
     def _build_secondary_panel(self) -> None:
         if not self.secondary_stream_name or not self._secondary_canvas_id:
@@ -423,9 +439,22 @@ class SegmentationDashboard:
         self._sync_overlay_placeholder()
         self._sync_default_roi()
         self._latest_segments = result.mask_classes if result.mask_classes is not None else result.segments
-        if result.mask_classes is not None:
+        fusion_status = self._fusion_status_provider() if self._fusion_status_provider else None
+        if fusion_status:
+            decision = fusion_status.decision or fusion_status.bottom.decision
+            self._update_status_label_values(
+                decision,
+                fusion_status.bottom.drivable_ratio,
+                fusion_status.bottom.left_right_diff,
+            )
+            self._update_fusion_labels(fusion_status)
+        elif result.mask_classes is not None:
             metrics = self._compute_mask_metrics(result.mask_classes)
-            self._update_status_label(metrics)
+            self._update_status_label_values(
+                metrics.decision,
+                metrics.drivable_ratio,
+                metrics.left_right_ratio,
+            )
 
     def _compose_overlay(self, result) -> np.ndarray:
         overlay = self.labels.build_overlay(result.segments)
@@ -478,23 +507,50 @@ class SegmentationDashboard:
             decision = "STOP"
         return Metrics(drivable_ratio, left_right_balance, decision)
 
-    def _update_status_label(self, metrics: Metrics) -> None:
+    def _update_status_label_values(
+        self,
+        decision: str,
+        drivable_ratio: float,
+        left_right_value: float,
+    ) -> None:
         status_text = (
-            f"Status: {metrics.decision} | drivable={metrics.drivable_ratio:.2f} "
-            f"| L-R={metrics.left_right_ratio:+.2f}"
+            f"Status: {decision} | drivable={drivable_ratio:.2f} "
+            f"| L-R={left_right_value:+.2f}"
         )
         if self._status_label:
             self._status_label.text = status_text
-            color = STATUS_COLORS.get(metrics.decision, "#e5e7eb")
+            color = STATUS_COLORS.get(decision, "#e5e7eb")
             self._status_label.style(f"color: {color}")
         steer_hint = "CENTER"
-        if metrics.left_right_ratio > 0.05:
+        if left_right_value > 0.05:
             steer_hint = "LEFT"
-        elif metrics.left_right_ratio < -0.05:
+        elif left_right_value < -0.05:
             steer_hint = "RIGHT"
         if self._debug_label:
             self._debug_label.text = f"ROI y={self.roi_y}px | steer={steer_hint}"
         self._refresh_roi_label()
+
+    def _update_fusion_labels(self, status: FusionStatus) -> None:
+        if not status:
+            return
+        if self._fusion_decision_label:
+            decision = status.decision or status.bottom.decision
+            self._fusion_decision_label.text = f"Fusion: {decision}"
+            color = STATUS_COLORS.get(decision, "#e5e7eb")
+            self._fusion_decision_label.style(f"color: {color}")
+        if self._fusion_bottom_label:
+            self._fusion_bottom_label.text = (
+                f"Bottom ROI: {status.bottom.drivable_ratio * 100:.1f}% "
+                f"| L-R={status.bottom.left_right_diff:+.2f}"
+            )
+        if self._fusion_front_label:
+            state = "clear" if not status.front.detected else "obstacle"
+            warning = f" | {status.warning}" if status.warning else ""
+            self._fusion_front_label.text = (
+                f"Front: {state} ({status.front.obstacle_ratio * 100:.1f}%)" + warning
+            )
+            color = "#16a34a" if not status.front.detected else "#dc2626"
+            self._fusion_front_label.style(f"color: {color}")
 
     @staticmethod
     def _to_data_url(image: np.ndarray) -> str:
